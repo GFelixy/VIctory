@@ -164,7 +164,7 @@ fn build() -> &'static [u8; 32] {
             // first shader of every run.
             KeyMode::Exe => {
                 let hashed = std::env::current_exe()
-                    .and_then(|path| std::fs::File::open(path))
+                    .and_then(std::fs::File::open)
                     .and_then(|file| h.update_reader(file));
                 if let Err(e) = hashed {
                     // Without it no entry can be trusted: a fresh key per run.
@@ -511,19 +511,20 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
             shift: u8::try_from(r.word()?).ok().filter(|&s| s < 32)?,
         });
     }
-    r.0.is_empty().then(|| {
-        Ok(HostShader {
-            stage,
-            dxil,
-            user_data,
-            samplers,
-            static_samplers,
-            root_cbvs,
-            root_srvs,
-            root_uavs,
-            root_indexed_views,
-        })
-    })
+    if !r.0.is_empty() {
+        return None;
+    }
+    Some(Ok(HostShader {
+        stage,
+        dxil,
+        user_data,
+        samplers,
+        static_samplers,
+        root_cbvs,
+        root_srvs,
+        root_uavs,
+        root_indexed_views,
+    }))
 }
 
 #[cfg(test)]
