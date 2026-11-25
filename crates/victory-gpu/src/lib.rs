@@ -56,6 +56,7 @@ mod switch;
 mod tdr;
 #[cfg(windows)]
 mod texture;
+mod usage;
 #[cfg(windows)]
 mod watch;
 

@@ -7411,6 +7411,8 @@ impl Host {
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+        // One line a second on what the run uses, before the present waits.
+        self.usage_line();
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -7678,6 +7680,50 @@ impl Host {
             self.log_video_memory("right after that change");
         }
         Some([own.Budget, own.CurrentUsage, shared.Budget, shared.CurrentUsage])
+    }
+
+    /// One line a second on what the run uses of the machine: the processor
+    /// cores of this process, the card's engines it drives, its memory, and
+    /// the card's memory as the system accounts it to this process.
+    fn usage_line(&self) {
+        static LAST: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        if let Some(then) = *last
+            && now.duration_since(then) < std::time::Duration::from_secs(1)
+        {
+            return;
+        }
+        *last = Some(now);
+        drop(last);
+        let s = crate::usage::sample();
+        let cpu = match s.cores {
+            Some(cores) => format!(
+                "{cores:.1} of {} cores ({:.0}%)",
+                s.logical,
+                100.0 * cores / s.logical.max(1) as f64
+            ),
+            None => "-".to_owned(),
+        };
+        let gpu = match s.gpu {
+            Some(all) => format!("{all:.0}%"),
+            None => "-".to_owned(),
+        };
+        let gb = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+        let vram = match self.video_memory_groups() {
+            Some([own, shared]) => format!(
+                "{:.1} of {:.1} GB (shared {:.1} GB)",
+                gb(own[1]),
+                gb(own[0]),
+                gb(shared[1])
+            ),
+            None => "-".to_owned(),
+        };
+        tracing::info!(
+            "using       cpu {cpu}, gpu {gpu}, ram {:.1} GB (commit {:.1} GB), vram {vram}",
+            gb(s.ram),
+            gb(s.commit)
+        );
     }
 
     /// Both of the system's memory groups for this process, in bytes: for
