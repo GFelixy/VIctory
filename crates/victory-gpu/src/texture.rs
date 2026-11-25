@@ -316,7 +316,9 @@ pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sy
 /// refreshing the same texture), asking the write watch and the guards,
 /// waiting for title memory to hold still (the lock the runtime takes
 /// alone while it remaps, `crate::watch::title_memory_reading`), and the
-/// refreshes in all.
+/// refreshes in all; then where what the three leave goes: asking what of
+/// the texture is mapped (4), reading it through the kernel (5, reading
+/// around unmapped pages included), hashing it (6) and detiling it (7).
 ///
 /// While the world streams in, the frame line's "textures" is seconds a
 /// frame in some runs and tenths in others for the same megabytes (2,566
@@ -324,11 +326,21 @@ pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sy
 /// counters, runs 81, 83, 85 and 94 each had lines of 1.5-2.9 s), and the
 /// submitting thread is not running while it lasts (run 93: 240-310 ms of
 /// its own time a frame beside 1,100-1,800 ms of "textures"): it waits.
-/// These say for what.
-pub(crate) static REFRESH_WAITS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// These say for what. Run 74 left 16.3 s of one frame's 492 MB, with none
+/// of it waiting for title memory: the four places below say whether it was
+/// the asking, the reading, the hash or the detile.
+pub(crate) static REFRESH_WAITS: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+/// Since the last frame-rate line: the refreshes there were, the longest one
+/// in microseconds, and how many took a millisecond or more. A frame's
+/// "textures" is the time of all of them on every thread, and `10 refreshes
+/// 160 MB` beside `16287 ms of textures` (run 74) says either that a few of
+/// them waited for something for seconds or that thousands took 2 ms each:
+/// these two numbers tell which.
+pub(crate) static REFRESH_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// `f`'s result, its time added to [`REFRESH_WAITS`]' place `slot`.
-fn waited<T>(slot: usize, f: impl FnOnce() -> T) -> T {
+pub(crate) fn waited<T>(slot: usize, f: impl FnOnce() -> T) -> T {
     let started = std::time::Instant::now();
     let out = f();
     REFRESH_WAITS[slot].fetch_add(started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -352,6 +364,11 @@ fn with_read<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
         }
         f(&mut read[..size])
     })
+}
+
+/// A texture's memory hashed, its time added to [`REFRESH_WAITS`] (6).
+fn hash(memory: &[u8]) -> blake3::Hash {
+    waited(6, || blake3::hash(memory))
 }
 
 /// Whether a texture all of whose memory is mapped is read through the
@@ -672,9 +689,16 @@ impl Staging {
 
     /// Returns the bytes of title memory read.
     fn refresh_now(&self) -> usize {
+        use std::sync::atomic::Ordering::Relaxed;
         let whole = std::time::Instant::now();
         let read = self.refresh_timed();
-        REFRESH_WAITS[3].fetch_add(whole.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        let us = whole.elapsed().as_micros() as u64;
+        REFRESH_WAITS[3].fetch_add(us, Relaxed);
+        REFRESH_STATS[0].fetch_add(1, Relaxed);
+        REFRESH_STATS[1].fetch_max(us, Relaxed);
+        if us >= 1000 {
+            REFRESH_STATS[2].fetch_add(1, Relaxed);
+        }
         read
     }
 
@@ -691,7 +715,7 @@ impl Staging {
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
             with_read(size, |read| {
-                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                waited(5, || crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false));
                 self.detile(read);
             });
             #[cfg(feature = "diagnostics")]
@@ -737,7 +761,7 @@ impl Staging {
         } else {
             waited(2, crate::watch::title_memory_reading)
         };
-        if !committed(self.memory, size) {
+        if !waited(4, || committed(self.memory, size)) {
             // Partly mapped: a streamed texture with only some mips' pages
             // there, the usual state while it streams in. Read through the
             // copy, which stands unmapped pages (zeros), and upload what
@@ -753,12 +777,12 @@ impl Staging {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
-                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                let hash = blake3::hash(read);
-                if last.hash == Some(hash) {
+                waited(5, || crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false));
+                let digest = hash(read);
+                if last.hash == Some(digest) {
                     return false;
                 }
-                last.hash = Some(hash);
+                last.hash = Some(digest);
                 if read.iter().all(|&b| b == 0) {
                     return false;
                 }
@@ -774,7 +798,7 @@ impl Staging {
         }
         if through_copy() {
             return with_title(self.memory, size, |tiled| {
-                let hash = blake3::hash(tiled);
+                let hash = hash(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
                 if last.hash == Some(hash) {
@@ -790,7 +814,7 @@ impl Staging {
         // SAFETY: committed memory of the texture's layout size, and it
         // stays committed while `_mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        let hash = blake3::hash(tiled);
+        let hash = hash(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
@@ -815,7 +839,7 @@ impl Staging {
             if !crate::host::read_into(self.memory, read) {
                 return false;
             }
-            let hash = blake3::hash(read);
+            let hash = hash(read);
             if last.hash != Some(hash) {
                 last.hash = Some(hash);
                 self.detile(read);
@@ -834,6 +858,10 @@ impl Staging {
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
+        waited(7, || self.detile_now(tiled));
+    }
+
+    fn detile_now(&self, tiled: &[u8]) {
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
@@ -847,8 +875,10 @@ impl Staging {
             let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
-            let len = pitch * rows as usize * f.Depth as usize;
-            // SAFETY: the subresource's part of the mapped staging buffer.
+            let len = subresource_len(footprint.Offset, pitch, rows, f.Depth, self.bytes);
+            // SAFETY: `subresource_len` clamps `len` to `self.bytes - footprint.Offset`,
+            // keeping the slice strictly inside the mapped staging buffer even when
+            // GetCopyableFootprints does not pad the final row of the last subresource.
             let linear = unsafe {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
             };
@@ -861,6 +891,18 @@ impl Staging {
             }
         }
     }
+}
+
+/// Bytes available in the staging buffer for a subresource at `offset`.
+/// D3D12's `GetCopyableFootprints` omits trailing row-pitch padding on the
+/// final row of the final subresource, so `pitch * rows * depth` can exceed
+/// `total - offset`.
+fn subresource_len(offset: u64, pitch: usize, rows: u32, depth: u32, total: u64) -> usize {
+    let padded = pitch
+        .saturating_mul(rows as usize)
+        .saturating_mul(depth as usize);
+    let remaining = usize::try_from(total.saturating_sub(offset)).unwrap_or(usize::MAX);
+    padded.min(remaining)
 }
 
 /// Lets go of a title texture's staging buffer (lists that recorded an
@@ -975,16 +1017,57 @@ fn by_query() -> bool {
 /// page not in the working set may still be there (never touched, or
 /// trimmed), and a one-byte read through the kernel says.
 /// A page that is committed and may not be read counts as not there, which
-/// is what the callers ask for: they read or write the memory next.
-fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
+/// is what the callers ask for: they read or write the memory next. The
+/// same question is put before a copy's plain copy of a title range
+/// (`crate::host::readable_in_place`), in place of one `VirtualQuery` per
+/// copy.
+pub(crate) fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
+    const KERNEL_PAGE: usize = 4096;
+    let (first, last) = (at / KERNEL_PAGE, at.saturating_add(len.saturating_sub(1)) / KERNEL_PAGE);
+    let of = last - first + 1;
+    let mut there = 0;
+    page_runs(at, len, |_, _, pages, readable| {
+        if readable {
+            there += pages;
+            true
+        } else {
+            !all
+        }
+    });
+    (there, of)
+}
+
+/// Walks the kernel's pages of `[at, at + len)` and calls `f` on each run of
+/// pages that answer the same: the run's offset from `at` (clipped to it),
+/// its bytes (clipped to `len`), how many kernel pages it has, and whether
+/// they may be read. `f` returns whether to go on.
+///
+/// The question is put to the working set, 256 pages at a time
+/// (`K32QueryWorkingSetEx`: the state of each page, no walk of the page
+/// tables); a page it does not have may still be readable (a page of a
+/// file's view reads as not in the set under wine, and one the console's
+/// runtime trimmed), and a one-byte read through the kernel says. A page
+/// that is committed and may not be read counts as not readable, which is
+/// what the callers ask for: they copy it next.
+///
+/// `VirtualQuery` answers the same question with the length of the run of
+/// pages in one state, which it finds by walking the page tables to that
+/// run's end: 0.6 ms for one question in the title's big pools, measured in
+/// this fork's runs (2 ms and 8.8 ms in the biggest), and every copy that
+/// met one page that was not there asked it three times over the same bytes.
+/// A page of this walk costs some 23 ns, so this is what the copies ask.
+pub(crate) fn page_runs(at: usize, len: usize, mut f: impl FnMut(usize, usize, usize, bool) -> bool) {
     use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     const KERNEL_PAGE: usize = 4096;
-    let (first, last) = (at / KERNEL_PAGE, at.saturating_add(len - 1) / KERNEL_PAGE);
-    let of = last - first + 1;
-    let mut there = 0;
+    if len == 0 {
+        return;
+    }
+    let end = at.saturating_add(len);
+    let (first, last) = (at / KERNEL_PAGE, (end - 1) / KERNEL_PAGE);
     // SAFETY: plain data.
     let mut info: [PSAPI_WORKING_SET_EX_INFORMATION; 256] = unsafe { std::mem::zeroed() };
+    let mut answers = [false; 256];
     let mut page = first;
     while page <= last {
         let n = (last - page + 1).min(info.len());
@@ -1003,31 +1086,82 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
             // Bit 0 of the answer: the page is in the working set.
             // SAFETY: plain data the query filled in.
             let valid = asked && unsafe { entry.VirtualAttributes.Flags } & 1 != 0;
-            let mut byte = [0u8];
-            if valid || crate::host::read_into(((page + i) * KERNEL_PAGE) as *const u8, &mut byte) {
-                there += 1;
-            } else if all {
-                return (there, of);
-            }
+            // A page it has not may still be readable (a page of a file's
+            // view reads as not in the set under wine and can be read): one
+            // byte through the kernel says. Not through `read`, which asks
+            // `VirtualQuery` of the region first — the walk this check
+            // exists to leave out.
+            answers[i] = valid || crate::host::readable_byte(((page + i) * KERNEL_PAGE) as *const u8);
+        }
+        // A run is cut where two batches meet: the caller copies or counts
+        // it, and two pieces of one run are no different to it.
+        let mut stop = false;
+        runs_of(&answers[..n], |index, pages, readable| {
+            stop = !one_run(at, end, page + index, page + index + pages, readable, &mut f);
+            !stop
+        });
+        if stop {
+            return;
         }
         page += n;
     }
-    (there, of)
+}
+
+/// The runs of pages in `answers` that answer the same, in order:
+/// `(first index, pages, answer)`, given to `f` until it says stop.
+pub(crate) fn runs_of(answers: &[bool], mut f: impl FnMut(usize, usize, bool) -> bool) {
+    let mut i = 0;
+    while i < answers.len() {
+        let answer = answers[i];
+        let first = i;
+        while i < answers.len() && answers[i] == answer {
+            i += 1;
+        }
+        if !f(first, i - first, answer) {
+            return;
+        }
+    }
+}
+
+/// Calls `f` for the run of pages `[from, to)` of a walk of `[at, end)`.
+fn one_run(
+    at: usize,
+    end: usize,
+    from: usize,
+    to: usize,
+    readable: bool,
+    f: &mut impl FnMut(usize, usize, usize, bool) -> bool,
+) -> bool {
+    const KERNEL_PAGE: usize = 4096;
+    let (start, stop) = ((from * KERNEL_PAGE).max(at), (to * KERNEL_PAGE).min(end));
+    if start >= stop {
+        return true;
+    }
+    f(start - at, stop - start, to - from, readable)
 }
 
 fn committed_by_query(at: *const u8, len: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
     let mut p = at as usize;
-    let end = p + len;
+    let Some(end) = p.checked_add(len) else {
+        return false;
+    };
     while p < end {
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
         let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
-        if n == 0 || info.State != MEM_COMMIT {
+        let unreadable = info.Protect == 0 || info.Protect & (PAGE_NOACCESS | PAGE_GUARD) != 0;
+        if n == 0 || info.State != MEM_COMMIT || unreadable {
             return false;
         }
-        p = info.BaseAddress as usize + info.RegionSize;
+        let next = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+        if next <= p {
+            return false;
+        }
+        p = next;
     }
     true
 }
@@ -1274,6 +1408,128 @@ mod title_memory_tests {
                     .expect("the staging buffer's bytes are enough");
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
+        }
+    }
+}
+
+/// The copy's chunking, without the kernel: which pages of a walk become
+/// one run (one copy, or one run of zeros), and how a run is cut to the
+/// range the caller asked about. Pure functions, so a failure here says the
+/// copy's bytes would differ from the region walk's.
+#[cfg(test)]
+mod page_run_tests {
+    use super::{one_run, runs_of};
+
+    fn runs(answers: &[bool]) -> Vec<(usize, usize, bool)> {
+        let mut out = Vec::new();
+        runs_of(answers, |first, pages, answer| {
+            out.push((first, pages, answer));
+            true
+        });
+        out
+    }
+
+    /// Every page is in exactly one run, in order, and adjacent pages that
+    /// answer the same are one run: a copy of 98 MB of title memory asks the
+    /// kernel once per 256 pages and copies once per run.
+    #[test]
+    fn pages_that_answer_the_same_make_one_run() {
+        assert_eq!(runs(&[true]), [(0, 1, true)]);
+        assert_eq!(runs(&[false]), [(0, 1, false)]);
+        assert_eq!(runs(&[true, true, true]), [(0, 3, true)]);
+        assert_eq!(runs(&[true, true, false, true]), [(0, 2, true), (2, 1, false), (3, 1, true)]);
+        assert_eq!(runs(&[false, false, true]), [(0, 2, false), (2, 1, true)]);
+        assert_eq!(runs(&[]), []);
+        // Every page of every mix of answers is covered once, in order.
+        for bits in 0u32..1 << 8 {
+            let answers: Vec<bool> = (0..8).map(|i| bits >> i & 1 == 1).collect();
+            let mut next = 0;
+            for (first, pages, _) in runs(&answers) {
+                assert_eq!(first, next, "{answers:?}");
+                next += pages;
+            }
+            assert_eq!(next, answers.len(), "{answers:?}");
+        }
+    }
+
+    /// A run is handed to the copy clipped to the range it was asked about:
+    /// the bytes before the range's first byte and after its last are not
+    /// the copy's (the destination does not hold them).
+    #[test]
+    fn a_run_is_cut_to_the_range() {
+        const PAGE: usize = 4096;
+        // What `f` was told, for a run `[from, to)` of the walk `[at, end)`.
+        let asked = |at: usize, end: usize, from: usize, to: usize| {
+            let mut asked = Vec::new();
+            assert!(one_run(at, end, from, to, true, &mut |offset, bytes, pages, readable| {
+                asked.push((offset, bytes, pages, readable));
+                true
+            }));
+            asked
+        };
+        // A whole range, page aligned: one run, as it is.
+        assert_eq!(asked(16 * PAGE, 20 * PAGE, 16, 18), [(0, 2 * PAGE, 2, true)]);
+        // A range that starts inside a page: the run starts at the range's
+        // first byte, and the page counts whole.
+        assert_eq!(asked(16 * PAGE + 100, 18 * PAGE, 16, 18), [(0, 2 * PAGE - 100, 2, true)]);
+        // A range that ends inside a page.
+        assert_eq!(asked(16 * PAGE, 17 * PAGE + 100, 16, 18), [(0, PAGE + 100, 2, true)]);
+        // A run wholly outside the range is not handed over.
+        assert!(asked(16 * PAGE, 17 * PAGE, 20, 21).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subresource_len_stays_inside_staging_total() {
+        // A 4x4 RGBA8 texture has RowPitch=256, rows=4, last_row=16 -> total=784.
+        // Padded size (1024) must be clamped to 784 so from_raw_parts_mut stays in bounds.
+        assert_eq!(subresource_len(0, 256, 4, 1, 784), 784);
+        assert_eq!(subresource_len(512, 256, 4, 1, 784), 272);
+        assert_eq!(subresource_len(0, 256, 4, 1, 2048), 1024);
+    }
+
+    /// Both ways of asking: by page (the default) and by `VirtualQuery`.
+    #[test]
+    fn committed_rejects_overflow_and_noaccess_pages() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree,
+        };
+        let ways: [fn(*const u8, usize) -> bool; 2] = [committed, committed_by_query];
+        for committed in ways {
+            assert!(!committed(usize::MAX as *const u8, 16));
+            // SAFETY: reserving and committing one private page for the test, freed below.
+            let noaccess = unsafe {
+                VirtualAlloc(
+                    std::ptr::null(),
+                    4096,
+                    MEM_RESERVE | MEM_COMMIT,
+                    PAGE_NOACCESS,
+                )
+            };
+            assert!(!noaccess.is_null());
+            assert!(!committed(noaccess.cast::<u8>(), 4096));
+            // SAFETY: freeing the allocation above.
+            unsafe { VirtualFree(noaccess, 0, MEM_RELEASE) };
+
+            // Negative control: a readable committed page still passes.
+            // SAFETY: reserving and committing one private page for the test, freed below.
+            let rw = unsafe {
+                VirtualAlloc(
+                    std::ptr::null(),
+                    4096,
+                    MEM_RESERVE | MEM_COMMIT,
+                    PAGE_READWRITE,
+                )
+            };
+            assert!(!rw.is_null());
+            assert!(committed(rw.cast::<u8>(), 4096));
+            // SAFETY: freeing the allocation above.
+            unsafe { VirtualFree(rw, 0, MEM_RELEASE) };
         }
     }
 }

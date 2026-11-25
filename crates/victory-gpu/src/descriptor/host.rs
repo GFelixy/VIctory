@@ -46,14 +46,18 @@ pub(crate) struct HostHeap {
     /// slots were free, but in pieces, and every such table walked the
     /// whole ring before it was refused: 0.33 ms each with 131,072 slots,
     /// 1.0 s of the recording threads in a frame that refused 3,143 (run
-    /// 45), under the lock all of them need. (A free run that lies across
-    /// the place the search starts from is seen by neither.)
+    /// 45), under the lock all of them need.
     too_long: std::sync::atomic::AtomicU32,
     /// View heaps: the bytes per element of the buffer view at each title
     /// slot, for shaders that pick a buffer by an index they compute
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
     /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
     strides: Option<(ID3D12Resource, u64, usize)>,
+    /// View heaps: the 64-bit title GPU address of the buffer view at each
+    /// title slot (`victory_shader::emit::SLOT_VIEW_ADDRESSES`): an upload
+    /// buffer of `SLOT_STRIDES_COUNT` pairs of dwords (lo, hi), its GPU
+    /// address and its mapping.
+    addresses: Option<(ID3D12Resource, u64, usize)>,
     /// Title slots holding buffer views. Such a view gets its host slot
     /// (and its memory a host copy) only when something reads it: a draw
     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
@@ -364,6 +368,24 @@ struct Waiting {
     /// the fingerprint it had at the upload, how many looks found it
     /// unchanged, and the frame of the upload. A fingerprint of 0: none.
     checked: (u64, u64, u64, u8, u64),
+    /// When [`TextureQueue::later`] may look at it again: a time, not a
+    /// frame.
+    ///
+    /// Cheap slots come back after 1, 2, 4 … frames, which is right while
+    /// frames are short. In the first world frames they are 3-5 s each
+    /// (run: 19191 slots due, the oldest written 2378 frames before), so a
+    /// slot put off by 256 frames comes back in twenty minutes and holds a
+    /// place in the 4096 a frame hands out meanwhile. A slot whose memory
+    /// the title never fills must not cost frame time it cannot repay.
+    retry: Option<std::time::Instant>,
+}
+
+impl Waiting {
+    /// Whether it is this frame's turn: written `due` frames ago or more,
+    /// and not put off to a time that has not come.
+    fn is_due(&self, frame: u64, now: std::time::Instant) -> bool {
+        self.due <= frame && self.retry.is_none_or(|at| at <= now)
+    }
 }
 
 /// The queue of title slots whose texture view waits to be brought up to
@@ -386,7 +408,7 @@ impl TextureQueue {
         }
         self.writes += 1;
         let write = self.writes;
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
+        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), retry: None });
     }
 
     fn remove(&mut self, index: u32) {
@@ -403,10 +425,10 @@ impl TextureQueue {
     ///   25,000-40,000 while the textures of the shot on screen waited
     ///   (run 52: 98% of the drawn pixels had no colour texture in the
     ///   first 3D frames).
-    fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
+    fn due(&self, frame: u64, now: std::time::Instant, max: usize) -> Vec<(u32, u64)> {
         let mut again: Vec<(u64, u32, u64)> = Vec::new();
         let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
-        for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
+        for (&index, w) in self.slots.iter().filter(|(_, w)| w.is_due(frame, now)) {
             let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
             class.push((w.written, index, w.write));
         }
@@ -441,10 +463,20 @@ impl TextureQueue {
     }
 
     /// Nothing to upload at slot `index` now: looked at again after 1, 2,
-    /// 4, ... frames, at most `most`.
-    fn later(&mut self, index: u32, write: u64, frame: u64, most: u64) {
+    /// 4, ... milliseconds, at most `most` of them.
+    ///
+    /// By the clock, not by frames. A backlog is worst exactly when frames
+    /// are seconds long, and 256 frames of a 5 s frame is twenty minutes:
+    /// the slot would sit in the queue taking one of the 4096 places a
+    /// frame hands out, and the slot the shot needs would go unserved. The
+    /// gap a slow frame has to cross is a fraction of a second either way,
+    /// so `most` comes from what a frame costs (`draw.rs`), and a slot
+    /// whose memory the title never fills costs its share of that, not a
+    /// place in every frame's order.
+    fn later(&mut self, index: u32, write: u64, most: u64) {
         if let Some(w) = self.same(index, write) {
-            w.due = frame + (1u64 << w.looks.min(16)).min(most.max(1));
+            let ms = (1u64 << w.looks.min(11)).min(most.max(1));
+            w.retry = Some(std::time::Instant::now() + std::time::Duration::from_millis(ms));
             w.looks = w.looks.saturating_add(1);
         }
     }
@@ -458,13 +490,18 @@ impl TextureQueue {
     }
 
     /// Slot `index` was uploaded whole from memory `at` (address, bytes)
-    /// with fingerprint `print`: looked at again from frame `due`, for a
+    /// with fingerprint `print`: looked at again after `after_ms`, for a
     /// title that fills a texture's memory after it wrote the view (the
     /// `looks`-th such look; `uploaded` is the upload's frame).
+    ///
+    /// The wait is the clock's, like [`TextureQueue::later`]'s: the frame
+    /// that waits for a fill is the slow one, and frames of it are not a
+    /// length of time.
     #[allow(clippy::too_many_arguments)]
-    fn recheck(&mut self, index: u32, write: u64, due: u64, at: (u64, u64), print: u64, looks: u8, uploaded: u64) {
+    fn recheck(&mut self, index: u32, write: u64, after_ms: u64, at: (u64, u64), print: u64, looks: u8, uploaded: u64) {
         if let Some(w) = self.same(index, write) {
-            (w.due, w.looks, w.mapped) = (due, 1, 0);
+            (w.due, w.looks, w.mapped) = (0, 1, 0);
+            w.retry = Some(std::time::Instant::now() + std::time::Duration::from_millis(after_ms.max(1)));
             w.checked = (at.0, at.1, print, looks, uploaded);
         }
     }
@@ -483,7 +520,7 @@ impl TextureQueue {
         self.writes += 1;
         let write = self.writes;
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
+        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), retry: None });
     }
 
     /// Bytes of slot `index`'s memory that were mapped at its last upload
@@ -495,7 +532,7 @@ impl TextureQueue {
     /// For the frame line: slots in the queue; of them due at `frame`;
     /// waiting for their memory (looked at, never uploaded); uploaded in
     /// part; and the frames the oldest due one has waited since its write.
-    fn census(&self, frame: u64) -> [u64; 5] {
+    fn census(&self, frame: u64, now: std::time::Instant) -> [u64; 5] {
         let mut c = [self.slots.len() as u64, 0, 0, 0, 0];
         for w in self.slots.values() {
             if w.mapped > 0 {
@@ -503,7 +540,7 @@ impl TextureQueue {
             } else if w.looks > 0 {
                 c[2] += 1;
             }
-            if w.due <= frame {
+            if w.is_due(frame, now) {
                 c[1] += 1;
                 c[4] = c[4].max(frame.saturating_sub(w.written));
             }
@@ -751,6 +788,19 @@ impl HostHeap {
                 Some((buffer, gpu, data as usize))
             })
             .flatten();
+        let addresses = (!sampler)
+            .then(|| {
+                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 8;
+                let (buffer, data) = host.upload_buffer(bytes)?;
+                // SAFETY: the buffer's whole mapping; a live buffer.
+                let gpu = unsafe {
+                    std::ptr::write_bytes(data, 0, bytes as usize);
+                    buffer.GetGPUVirtualAddress()
+                };
+                crate::host::name(&buffer, || "buffer addresses by view heap slot".to_owned());
+                Some((buffer, gpu, data as usize))
+            })
+            .flatten();
         let h = HostHeap {
             heap,
             cpu,
@@ -764,6 +814,7 @@ impl HostHeap {
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
+            addresses,
             buffers: Mutex::default(),
             changed: Mutex::default(),
             textures: Mutex::default(),
@@ -861,12 +912,16 @@ impl HostHeap {
         let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
             && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
         let n = n as usize;
-        // Search from `next` on, then from the start.
-        let starts = (*next as usize..self.dynamic as usize).chain(0..*next as usize);
+        // Search from `next` on, then from the start (extending past cursor by
+        // n - 1 so contiguous runs crossing the cursor are not missed).
+        let cursor = *next as usize;
+        let end = self.dynamic as usize;
+        let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
+        let starts = (cursor..end).chain(0..second_end);
         let mut run = 0;
         let mut found = None;
         let mut last = usize::MAX;
-        for at in starts.take(if enough { DYNAMIC as usize } else { 0 }) {
+        for at in starts.take(if enough { usize::MAX } else { 0 }) {
             // A run cannot wrap past the end.
             if at != last.wrapping_add(1) {
                 run = 0;
@@ -917,13 +972,30 @@ impl HostHeap {
         self.strides.as_ref().map(|s| &s.0)
     }
 
+    /// The GPU address of the table of buffer addresses by title slot (view
+    /// heaps).
+    pub(crate) fn addresses_gpu(&self) -> Option<u64> {
+        self.addresses.as_ref().map(|a| a.1)
+    }
+
+    /// The buffer-address table's buffer, for a list to hold.
+    pub(crate) fn addresses_buffer(&self) -> Option<&ID3D12Resource> {
+        self.addresses.as_ref().map(|a| &a.0)
+    }
+
     /// Up to `max` title slots whose texture view is due at `frame`, each
     /// with its write number, in the order to serve them
     /// ([`TextureQueue::due`]), and the queue's counts
     /// ([`TextureQueue::census`]).
-    pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
+    pub(crate) fn texture_slots_due(
+        &self,
+        frame: u64,
+        now: std::time::Instant,
+        max: usize,
+    ) -> (Vec<(u32, u64)>, [u64; 5]) {
         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame))
+        let due = if max == 0 { Vec::new() } else { textures.due(frame, now, max) };
+        (due, textures.census(frame, now))
     }
 
     /// Every title slot of the queue that is due at `frame`, and whether
@@ -958,14 +1030,14 @@ impl HostHeap {
         &self,
         index: u32,
         write: u64,
-        due: u64,
+        after_ms: u64,
         at: (u64, u64),
         print: u64,
         looks: u8,
         uploaded: u64,
     ) {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        textures.recheck(index, write, due, at, print, looks, uploaded);
+        textures.recheck(index, write, after_ms, at, print, looks, uploaded);
     }
 
     /// See [`TextureQueue::checked`].
@@ -976,9 +1048,9 @@ impl HostHeap {
     /// Nothing to upload at title slot `index` now (its memory is not
     /// mapped, or no more of it than before): looked at again after 1, 2,
     /// 4, ... frames, at most `most`.
-    pub(crate) fn texture_slot_later(&self, index: u32, write: u64, frame: u64, most: u64) {
+    pub(crate) fn texture_slot_later(&self, index: u32, write: u64, most: u64) {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        textures.later(index, write, frame, most);
+        textures.later(index, write, most);
     }
 
     /// Bytes of title slot `index`'s memory that were mapped when it was
@@ -1240,6 +1312,17 @@ impl HostHeap {
             // SAFETY: inside the mapping; shaders read it while we write (a
             // dword, either value is one the slot had).
             unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
+        }
+        let address = view.and_then(view_address).unwrap_or(0);
+        if let Some((_, _, data)) = &self.addresses
+            && index < victory_shader::emit::SLOT_STRIDES_COUNT
+        {
+            // SAFETY: inside the mapping (2 dwords per slot).
+            unsafe {
+                let p = (*data as *mut u32).add(index as usize * 2);
+                p.write_volatile(address as u32);
+                p.add(1).write_volatile((address >> 32) as u32);
+            }
         }
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         let was = if stride.is_some() {
@@ -1607,6 +1690,21 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
         4
     } else {
         crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
+    }
+}
+
+/// The 64-bit title GPU virtual address a buffer or constant-buffer view
+/// points at (`victory_shader::emit::SLOT_VIEW_ADDRESSES`).
+fn view_address(view: &View) -> Option<u64> {
+    if let Some((addr, _)) = buffer_range(view) {
+        return Some(addr);
+    }
+    match view {
+        View::Shader(r, None) | View::Unordered(r, _, None) => {
+            crate::resource::buffer_bytes(*r as crate::object::This).map(|(p, _)| p as u64)
+        }
+        View::Constant(addr, _) => Some(*addr),
+        _ => None,
     }
 }
 
@@ -2521,37 +2619,45 @@ mod tests {
             q.written(10 + i, u64::from(i) + 1, 0, false);
         }
         q.written(5, 9, 0, false);
-        let order: Vec<u32> = q.due(9, 100).into_iter().map(|d| d.0).collect();
+        let order: Vec<u32> = q.due(9, std::time::Instant::now(), 100).into_iter().map(|d| d.0).collect();
         // newest, oldest, newest, oldest, and so on
         assert_eq!(order, [5, 10, 17, 11, 16, 12, 15, 13, 14]);
-        assert_eq!(q.due(9, 2).len(), 2);
-        assert_eq!(q.census(9), [9, 9, 0, 0, 8]);
-        // Slot 17's memory is not mapped: again next frame, then in 2, 4, 4.
-        let write = |q: &TextureQueue, index: u32| q.due(u64::MAX, 100).iter().find(|d| d.0 == index).unwrap().1;
+        assert_eq!(q.due(9, std::time::Instant::now(), 2).len(), 2);
+        assert_eq!(q.census(9, std::time::Instant::now()), [9, 9, 0, 0, 8]);
+        // Slot 17's memory is not mapped: it is looked at again after 1 ms,
+        // then 2, 4 … (by the clock, not by frames: a 5 s frame's 256-frame
+        // wait was twenty minutes, and the backlog it left never drained).
+        let write = |q: &TextureQueue, index: u32| {
+            q.due(u64::MAX, std::time::Instant::now(), 100).iter().find(|d| d.0 == index).unwrap().1
+        };
         let w17 = write(&q, 17);
-        let mut frame = 9;
-        for wait in [1, 2, 4, 4] {
-            q.later(17, w17, frame, 4);
-            assert!(!q.due(frame + wait - 1, 100).iter().any(|d| d.0 == 17));
-            frame += wait;
+        let mut waited = 0u64;
+        for wait_ms in [1u64, 2, 4] {
+            q.later(17, w17, 4000);
+            // Not before its time, whatever the frame says.
+            assert!(!q.due(u64::MAX, std::time::Instant::now(), 100).iter().any(|d| d.0 == 17));
+            std::thread::sleep(std::time::Duration::from_millis(wait_ms + 5));
             // Due again, and ahead of every slot never looked at.
-            assert_eq!(q.due(frame, 100)[0].0, 17);
+            assert_eq!(q.due(u64::MAX, std::time::Instant::now(), 100)[0].0, 17);
+            waited += wait_ms;
         }
-        assert_eq!(q.census(9)[2], 1);
+        assert!(waited > 0);
+        assert_eq!(q.census(u64::MAX, std::time::Instant::now())[2], 1);
         q.done(17, w17);
-        assert!(!q.due(u64::MAX, 100).iter().any(|d| d.0 == 17));
+        assert!(!q.due(u64::MAX, std::time::Instant::now(), 100).iter().any(|d| d.0 == 17));
         // Uploaded with part of its memory there: kept, with what was there.
         let w16 = write(&q, 16);
         q.partly(16, w16, 12, 4096);
         assert_eq!(q.mapped(16), 4096);
-        assert_eq!(q.due(12, 100)[0].0, 16);
+        assert_eq!(q.due(12, std::time::Instant::now(), 100)[0].0, 16);
         // The title writes slot 16 again while the pass works on it: what
         // the pass then says about the old write changes nothing.
         q.written(16, 13, 0, false);
         q.done(16, w16);
-        q.later(16, w16, 13, 4);
+        q.later(16, w16, 4);
+        std::thread::sleep(std::time::Duration::from_millis(20));
         assert_eq!(q.mapped(16), 0);
-        assert_eq!(q.due(13, 100)[0].0, 16);
+        assert_eq!(q.due(13, std::time::Instant::now(), 100)[0].0, 16);
         // A draw that makes the host slot (`seen`) keeps what the queue knows,
         let w15 = write(&q, 15);
         q.partly(15, w15, 20, 8192);
@@ -2559,11 +2665,11 @@ mod tests {
         assert_eq!(q.mapped(15), 8192);
         // and queues a slot the queue did not hold.
         q.written(99, 14, 0, true);
-        assert!(q.due(14, 100).iter().any(|d| d.0 == 99));
+        assert!(q.due(14, std::time::Instant::now(), 100).iter().any(|d| d.0 == 99));
         // A write due later (a table's slot) is not handed out before.
         q.written(98, 14, 16, false);
-        assert!(!q.due(15, 100).iter().any(|d| d.0 == 98));
-        assert!(q.due(16, 100).iter().any(|d| d.0 == 98));
+        assert!(!q.due(15, std::time::Instant::now(), 100).iter().any(|d| d.0 == 98));
+        assert!(q.due(16, std::time::Instant::now(), 100).iter().any(|d| d.0 == 98));
     }
 
     /// Textures of which only the smallest levels are held, packed into
@@ -2714,7 +2820,7 @@ mod tests {
         let Some(heap) = HostHeap::new(false, 8) else {
             return; // no host GPU
         };
-        let slots = |at: u64| -> Vec<u32> { heap.texture_slots_due(at, 8).0.into_iter().map(|d| d.0).collect() };
+        let slots = |at: u64| -> Vec<u32> { heap.texture_slots_due(at, std::time::Instant::now(), 8).0.into_iter().map(|d| d.0).collect() };
         // 64x64 BC7, one mip, at an address no test and no title uses.
         let at = 0x7fee_0000_0000u64;
         let view = |address: u64, width: u32| {
@@ -2724,7 +2830,7 @@ mod tests {
         };
         let len = crate::resource::placed_bytes(&[3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0]).unwrap();
         assert!(heap.note_buffer(1, Some(&view(at, 64)), false).is_empty());
-        let (queued, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
+        let (queued, write) = heap.texture_slots_due(u64::MAX, std::time::Instant::now(), 8).0[0];
         assert_eq!(queued, 1);
         heap.texture_slot_done(1, write, None);
         assert_eq!(slots(u64::MAX), []);
@@ -2748,7 +2854,7 @@ mod tests {
             return; // no host GPU
         };
         let frame = 100;
-        let slots = |at: u64| -> Vec<u32> { heap.texture_slots_due(at, 8).0.into_iter().map(|d| d.0).collect() };
+        let slots = |at: u64| -> Vec<u32> { heap.texture_slots_due(at, std::time::Instant::now(), 8).0.into_iter().map(|d| d.0).collect() };
         let texture = View::Placed(false, [3, 0, 0, 0, 4, 0, 4, 0x1_0001, 28, 1, 0, 0x105, 0, 0], [0; 16]);
         assert!(is_texture_view(&texture));
         heap.queue_texture(2, true, false, frame);

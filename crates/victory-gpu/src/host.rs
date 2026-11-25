@@ -7,6 +7,7 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
@@ -53,7 +54,7 @@ pub(crate) struct Host {
     /// layer's messages.
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
-    presenter: Mutex<Option<Presenter>>,
+    presenter: Mutex<Presentation>,
     /// The adapter the device is on, for its memory budget
     /// ([`Host::video_memory`]); `None` if the system does not name it.
     adapter: Option<IDXGIAdapter3>,
@@ -454,6 +455,109 @@ pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
+/// Which title buffers the copies went into (`VICTORY_COPY_REPORT=1`): for
+/// each one brought up to date since the last frame-rate line, where it
+/// starts, how long it is, the microseconds and the bytes copied. The
+/// totals are already on the frame line; this says which buffer they were.
+static COPY_WHERE: Mutex<Vec<(u64, u64, u64, u64)>> = Mutex::new(Vec::new());
+
+/// Where the copies' time goes, for the frame line: the page probes
+/// [`copy_mapped`] makes before it copies ([`probe`]). Counted always (a
+/// relaxed add a probe: a few nanoseconds against a copy's microseconds), so
+/// that a plain release run says what a diagnostics build would — the frame
+/// line's "copies" is one number for four different costs, and the run that
+/// showed 98.3 MB in 1750.7 ms could not say which of them it was.
+pub(crate) static PROBE: [std::sync::atomic::AtomicU64; 20] = [const { std::sync::atomic::AtomicU64::new(0) }; 20];
+
+/// The slots of [`PROBE`].
+#[allow(dead_code)]
+mod probe {
+    /// Copies asked for (`copy_mapped` calls), their bytes, and how many of
+    /// them are 1 MiB or more (the ranges a region walk can cost much for).
+    pub(super) const RANGES: usize = 0;
+    pub(super) const BYTES: usize = 1;
+    pub(super) const BIG: usize = 2;
+    /// Copies copied in user space after the probes said both ends were
+    /// there: calls, bytes, microseconds.
+    pub(super) const IN_PLACE: usize = 3;
+    pub(super) const IN_PLACE_BYTES: usize = 4;
+    pub(super) const IN_PLACE_US: usize = 5;
+    /// The source probe: microseconds, `VirtualQuery` calls made (one a
+    /// region: how many pieces the title's memory comes in), and of its
+    /// calls the ones asked page by page of the working set
+    /// (`crate::texture::readable`) instead.
+    pub(super) const SRC_US: usize = 6;
+    pub(super) const SRC_REGIONS: usize = 7;
+    pub(super) const SRC_PAGES_CALLS: usize = 8;
+    /// The destination probe (`writable`): microseconds, regions.
+    pub(super) const DST_US: usize = 9;
+    pub(super) const DST_REGIONS: usize = 10;
+    /// The whole read through the kernel: microseconds, calls, failures.
+    pub(super) const WHOLE_US: usize = 11;
+    pub(super) const WHOLE_CALLS: usize = 12;
+    pub(super) const WHOLE_FAILS: usize = 13;
+    /// The fallback after a failed whole read (sparse or pieces):
+    /// microseconds and calls.
+    pub(super) const FALLBACK_US: usize = 14;
+    pub(super) const FALLBACKS: usize = 15;
+    /// Bytes written as zeros: pages of the source that are not committed
+    /// (what the copy was asked for and could not have).
+    pub(super) const ZERO_BYTES: usize = 16;
+    /// Bytes asked for by the copies that had to fall back.
+    pub(super) const FAILED_BYTES: usize = 17;
+    /// The page-by-page source probe's own microseconds.
+    pub(super) const SRC_PAGES_US: usize = 18;
+    /// Copies whose source probe said no (they go to the kernel's read).
+    pub(super) const SRC_NO: usize = 19;
+}
+
+/// Adds to a [`PROBE`] slot.
+fn probe(slot: usize, n: u64) {
+    PROBE[slot].fetch_add(n, Ordering::Relaxed);
+}
+
+/// `VICTORY_COPY_REPORT=1`: print the buffers the copies went into, the
+/// biggest first, on every frame-rate line.
+pub(crate) fn report_copies() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_COPY_REPORT").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Logs [`PROBE`] per frame: where the copies' time goes, which of the
+/// masked pages there are, and how many pieces the title's memory comes in.
+fn log_probes(frames: f64) {
+    let per = |slot: usize| PROBE[slot].swap(0, Ordering::Relaxed) as f64 / frames;
+    let ms = |v: f64| v / 1e3;
+    let mb = |v: f64| v / 1e6;
+    tracing::info!(
+        "the copies' probes per frame: {:.0} ranges {:.1} MB ({:.0} of 1 MiB or more); \
+         copied in place {:.1} MB in {:.0} ranges, {:.2} ms; the source asked in {:.2} ms \
+         ({:.0} VirtualQuery calls, {:.0} page by page), {:.0} of them said no; the destination \
+         asked in {:.2} ms ({:.0} VirtualQuery calls); the kernel's whole read {:.2} ms in {:.0} \
+         calls, {:.0} of them failed ({:.1} MB); the fallback {:.2} ms in {:.0} copies; \
+         {:.1} MB written as zeros",
+        per(probe::RANGES),
+        mb(per(probe::BYTES)),
+        per(probe::BIG),
+        mb(per(probe::IN_PLACE_BYTES)),
+        per(probe::IN_PLACE),
+        ms(per(probe::IN_PLACE_US)),
+        ms(per(probe::SRC_US)),
+        per(probe::SRC_REGIONS),
+        per(probe::SRC_PAGES_CALLS),
+        per(probe::SRC_NO),
+        ms(per(probe::DST_US)),
+        per(probe::DST_REGIONS),
+        ms(per(probe::WHOLE_US)),
+        per(probe::WHOLE_CALLS),
+        per(probe::WHOLE_FAILS),
+        mb(per(probe::FAILED_BYTES)),
+        ms(per(probe::FALLBACK_US)),
+        per(probe::FALLBACKS),
+        mb(per(probe::ZERO_BYTES)),
+    );
+}
+
 /// Host buffers made since the start, as (count, bytes): in the upload heap
 /// (staging, list scratch), shared with the processor (host copies of title
 /// memory) and the graphics card's own (indirect arguments, twins' copies).
@@ -553,8 +657,7 @@ fn create() -> windows::core::Result<Host> {
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
         // The debug layer only in builds with diagnostics.
-        let debug =
-            cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DEBUG").is_some();
+        let debug = cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_DEBUG");
         if debug {
             let mut layer: Option<ID3D12Debug> = None;
             match D3D12GetDebugInterface(&mut layer) {
@@ -565,7 +668,7 @@ fn create() -> windows::core::Result<Host> {
             // descriptor heap indices and the like become messages naming
             // the command instead of page faults. Without state tracking
             // (directly indexed textures are not transitioned).
-            if std::env::var_os("VICTORY_D3D12_GBV").is_some()
+            if crate::switch::on("VICTORY_D3D12_GBV")
                 && let Some(l) = &layer
             {
                 if let Ok(d1) = l.cast::<ID3D12Debug1>() {
@@ -594,12 +697,14 @@ fn create() -> windows::core::Result<Host> {
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
-        if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
+        if cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_WARP") {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            // Whether a GPU hang ends the run or freezes the PC (#1054).
+            crate::tdr::log();
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         // `VICTORY_D3D12_BACKGROUND=0`: the runtime's background work (the
@@ -671,7 +776,7 @@ fn create() -> windows::core::Result<Host> {
             next_dsv: AtomicU32::new(0),
             messages,
             next_rtv: AtomicU32::new(0),
-            presenter: Mutex::new(None),
+            presenter: Mutex::new(Presentation::default()),
             adapter,
         })
     }
@@ -736,7 +841,66 @@ mod tests {
         }
     }
 
+    #[test]
+    fn swap_chain_failures_retry_once_per_second_and_success_clears_the_wait() {
+        use super::{Duration, Instant, SwapChainRetry};
+
+        let start = Instant::now();
+        let mut retry = SwapChainRetry::default();
+        let mut attempts = 0;
+        // Two seconds at 60 Hz, with a failure on every eligible attempt.
+        for frame in 0..120 {
+            retry.attempt(start + Duration::from_millis(frame * 1000 / 60), || {
+                attempts += 1;
+                Err::<(), _>("desktop unavailable")
+            });
+        }
+        assert_eq!(attempts, 2);
+        let recovered = start + Duration::from_secs(2);
+        assert_eq!(retry.attempt(recovered, || Ok::<_, ()>(42)), Some(Ok(42)));
+        assert_eq!(retry.attempt(recovered, || Ok::<_, ()>(43)), Some(Ok(43)));
+    }
+
     use super::*;
+
+    #[test]
+    fn list_scratch_grows_to_fit() {
+        let Some(host) = host() else { return };
+        let list = host.new_list().unwrap();
+        let sizes = || {
+            let s = list.scratch.lock().unwrap();
+            s.chunks.iter().map(|c| c.1).collect::<Vec<_>>()
+        };
+        let first = list.scratch(1).unwrap();
+        let second = list.scratch(1).unwrap();
+        assert_eq!(second.0 - first.0, 256);
+        assert_eq!(second.1 as usize - first.1 as usize, 256);
+        assert!(list.scratch(u64::MAX).is_none());
+        assert!(list.scratch(SCRATCH_CHUNK + 1).is_some());
+        if scratch_pool() {
+            assert_eq!(sizes(), [SCRATCH_FIRST]);
+            list.scratch(SCRATCH_FIRST).unwrap();
+            assert_eq!(sizes(), [SCRATCH_FIRST, 2 * SCRATCH_FIRST]);
+            // At least what is asked, at most a whole chunk.
+            let most = SCRATCH_CHUNK;
+            list.scratch(most).unwrap();
+            list.scratch(1).unwrap();
+            assert_eq!(sizes(), [SCRATCH_FIRST, 2 * SCRATCH_FIRST, most, most]);
+        } else {
+            assert_eq!(sizes(), [SCRATCH_CHUNK]);
+        }
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        // Shared chunks went back for the next list; a list's own are used
+        // again from the front.
+        if scratch_pool() {
+            assert!(sizes().is_empty());
+        } else {
+            assert_eq!(list.scratch(512).unwrap(), first);
+        }
+        list.close();
+    }
 
     #[test]
     fn warp_adapter_accepts_only_software() {
@@ -760,6 +924,113 @@ mod tests {
         assert_eq!(
             warp_adapter().is_ok(),
             desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
+        );
+    }
+
+    /// A node of the device-removed data is a list by pointer or by name.
+    /// The name is what still matches when the runtime records another
+    /// object than the one we hold (the debug layer wraps ours), and a
+    /// different list or an unnamed node never matches.
+    #[test]
+    fn a_breadcrumb_node_is_found_by_pointer_or_by_name() {
+        let ours = [0x1000, 0x1008];
+        let name = list_name(7);
+        let is = |pointer, text| node_is_list(pointer, text, &ours, &name);
+        assert_eq!(name, "victory host list 7");
+        assert!(is(Some(0x1000), None));
+        assert!(is(Some(0x1008), Some("other")));
+        assert!(is(Some(0x9999), Some("victory host list 7")));
+        assert!(is(None, Some("victory host list 7")));
+        assert!(!is(Some(0x9999), Some("victory host list 70")));
+        assert!(!is(Some(0x9999), None));
+        assert!(!is(None, None));
+        // The debug layer appends its own note to the name we gave.
+        assert!(is(None, Some("victory host list 7 (debug layer indirect)")));
+        assert!(is(None, Some("victory host list 7 (x)")));
+        assert!(!is(
+            None,
+            Some("victory host list 70 (debug layer indirect)")
+        ));
+        assert!(!is(None, Some("victory host list 7 debug layer")));
+        assert!(!is(None, Some("victory host list 7(")));
+        assert!(is(None, Some("victory host list 7")));
+        assert_eq!(list_name(70), "victory host list 70");
+    }
+
+    /// The pointers of one list: the interface pointers it answers with
+    /// are all there, and another list's are not.
+    #[test]
+    fn a_list_knows_every_pointer_it_answers_with() {
+        // SAFETY: plain device and list creation on the software adapter.
+        unsafe {
+            let Ok(adapter) = warp_adapter() else { return };
+            let mut device: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_err() {
+                return;
+            }
+            let device = device.unwrap();
+            // An open list holds its allocator: one each.
+            let make = || -> ID3D12GraphicsCommandList {
+                let allocator: ID3D12CommandAllocator = device
+                    .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                    .unwrap();
+                device
+                    .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+                    .unwrap()
+            };
+            let (a, b) = (make(), make());
+            let pointers = identities(&a);
+            assert!(pointers.contains(&(a.as_raw() as usize)));
+            let unknown = a.cast::<windows::core::IUnknown>().unwrap();
+            assert!(pointers.contains(&(unknown.as_raw() as usize)));
+            let command_list = a.cast::<ID3D12CommandList>().unwrap();
+            assert!(pointers.contains(&(command_list.as_raw() as usize)));
+            let other = identities(&b);
+            assert!(pointers.iter().all(|p| !other.contains(p)));
+            // As a node: the same object by any of its pointers; a node
+            // naming the other list by pointer and our name still matches.
+            let name = list_name(3);
+            let is = |pointer, text| node_is_list(pointer, text, &pointers, &name);
+            assert!(is(Some(command_list.as_raw() as usize), None));
+            assert!(!is(Some(b.as_raw() as usize), None));
+            assert!(is(Some(b.as_raw() as usize), Some(&name)));
+        }
+    }
+
+    /// A node as the runtime gives it, built by hand: `HostList::is_node`
+    /// reads the pointer and the copied name, and the name alone finds a
+    /// list the runtime records under another object.
+    #[test]
+    fn is_node_reads_the_name_the_runtime_copied() {
+        let Some(host) = host() else { return };
+        let Ok(list) = host.new_list() else { return };
+        let mut wide: Vec<u16> = list_name(list.id).encode_utf16().collect();
+        wide.push(0);
+        let mut node = D3D12_AUTO_BREADCRUMB_NODE::default();
+        assert!(!list.is_node(&node), "an empty node is no list");
+        node.pCommandListDebugNameW = windows::core::PCWSTR(wide.as_ptr());
+        assert!(list.is_node(&node), "found by its name alone");
+        let mut other: Vec<u16> = list_name(list.id + 1).encode_utf16().collect();
+        other.push(0);
+        node.pCommandListDebugNameW = windows::core::PCWSTR(other.as_ptr());
+        assert!(!list.is_node(&node), "another list's name is no match");
+        // With the debug layer: our name and the layer's note, in either
+        // name field; and a list whose number only starts with ours is not it.
+        let note = std::ffi::CString::new(format!("{} (debug layer indirect)", list_name(list.id)))
+            .unwrap();
+        node.pCommandListDebugNameW = windows::core::PCWSTR::null();
+        node.pCommandListDebugNameA = note.as_ptr().cast();
+        assert!(
+            list.is_node(&node),
+            "found by its ANSI name with the layer's note"
+        );
+        let longer =
+            std::ffi::CString::new(format!("{}0 (debug layer indirect)", list_name(list.id)))
+                .unwrap();
+        node.pCommandListDebugNameA = longer.as_ptr().cast();
+        assert!(
+            !list.is_node(&node),
+            "a number that only starts with ours is no match"
         );
     }
 }
@@ -788,6 +1059,9 @@ pub(crate) struct HostList {
     prelude: OnceLock<Option<Prelude>>,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
+    /// Which list this is, for the name that tells it apart in device-removed
+    /// data (see [`HostList::is_node`]).
+    id: u64,
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
@@ -1260,9 +1534,7 @@ fn record_twin_copy(
 /// builds).
 pub(crate) fn dred_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some()
-    })
+    *ON.get_or_init(|| cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_DRED"))
 }
 
 /// Indirect mesh dispatches since the last frame line: the largest group
@@ -1276,7 +1548,7 @@ static MESH_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atom
 #[cfg(feature = "diagnostics")]
 fn timing() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_TIMING").is_some())
+    *ON.get_or_init(|| crate::switch::on("VICTORY_GPU_TIMING"))
 }
 
 /// Names a host object for the device-removed report, which names the
@@ -1333,6 +1605,58 @@ struct Chunk {
 // written only by the list that holds the chunk.
 unsafe impl Send for Chunk {}
 
+/// The id of the next host list (see [`HostList::is_node`]).
+static NEXT_LIST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// The name a host list gets with device-removed data on.
+fn list_name(id: u64) -> String {
+    format!("victory host list {id}")
+}
+
+/// The pointers one of our list objects answers to: its own and the one each
+/// interface a runtime may record it by gives (COM identity is the
+/// `IUnknown` one). Only our live object is queried: a node of the
+/// device-removed data may name a list that is long released, so its pointer
+/// is compared and never dereferenced.
+fn identities(list: &impl Interface) -> Vec<usize> {
+    let mut found = vec![list.as_raw() as usize];
+    let mut add = |pointer: Option<*mut core::ffi::c_void>| {
+        if let Some(pointer) = pointer {
+            found.push(pointer as usize);
+        }
+    };
+    add(list
+        .cast::<windows::core::IUnknown>()
+        .ok()
+        .map(|i| i.as_raw()));
+    add(list.cast::<ID3D12Object>().ok().map(|i| i.as_raw()));
+    add(list.cast::<ID3D12DeviceChild>().ok().map(|i| i.as_raw()));
+    add(list.cast::<ID3D12CommandList>().ok().map(|i| i.as_raw()));
+    found.sort_unstable();
+    found.dedup();
+    found
+}
+
+/// Whether a node of the device-removed data is a list: by pointer, or by the
+/// name the runtime copied when the list was submitted. With the debug layer
+/// on, the object we hold is its wrapper and the runtime records another
+/// one, so no pointer of ours matches, and it appends its own note to our
+/// name ("victory host list 158 (debug layer indirect)"). The name matches
+/// exactly or followed by " (": never as the start of another number.
+fn node_is_list(
+    node_pointer: Option<usize>,
+    node_name: Option<&str>,
+    pointers: &[usize],
+    name: &str,
+) -> bool {
+    node_pointer.is_some_and(|p| pointers.contains(&p))
+        || node_name.is_some_and(|n| {
+            n == name
+                || n.strip_prefix(name)
+                    .is_some_and(|rest| rest.starts_with(" ("))
+        })
+}
+
 /// Upload chunks handed out front to back: the chunks (each with its
 /// bytes), the one in use and the bytes used in it.
 #[derive(Default)]
@@ -1354,7 +1678,8 @@ impl Drop for Scratch {
 const SCRATCH_CHUNK: u64 = 4 << 20;
 /// A list's first chunk when the chunks are shared ([`scratch_pool`]): most
 /// lists put a few constants or a rectangle's corners there, and every
-/// list that did took 4 MiB of the PC's memory for it.
+/// list that did took 4 MiB of the PC's memory for it. Each next chunk is
+/// twice the last (at least what is asked), up to [`SCRATCH_CHUNK`].
 const SCRATCH_FIRST: u64 = 256 << 10;
 /// The most bytes of chunks kept while no list holds them.
 const SPARE_MOST: u64 = 128 << 20;
@@ -1417,7 +1742,7 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
         return Some(chunk);
     }
     let (buffer, data) = host.upload_buffer(size)?;
-    name(&buffer, || "list scratch".into());
+    name(&buffer, || format!("list scratch {size:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     ALIVE[1].fetch_add(1, Ordering::Relaxed);
@@ -1701,8 +2026,7 @@ impl Drop for Deferred {
 /// 3. the next submission refreshes a range of a host copy that a flight's
 ///    shaders may write, and the title wrote a page of it since it was last
 ///    copied ([`stale_under_flights`]): the refresh leaves such a range
-///    alone until the flight's writes are back, as it always did within a
-///    submission;
+///    alone until the flight's writes are back;
 /// 4. a queue stands at a wait for a memory value that no flight's
 ///    bottom-of-pipe write is known to satisfy, at an address a flight may
 ///    write ([`late_met`]);
@@ -1729,7 +2053,7 @@ pub(crate) fn late() -> bool {
 fn late_stage() -> u8 {
     static STAGE: OnceLock<u8> = OnceLock::new();
     *STAGE.get_or_init(|| {
-        if std::env::var_os("VICTORY_GPU_TIMING").is_some() {
+        if crate::switch::on("VICTORY_GPU_TIMING") {
             return 0;
         }
         match std::env::var("VICTORY_LATE_WAIT").as_deref() {
@@ -2812,6 +3136,302 @@ fn hand_back(back: &[Declared]) {
     }
 }
 
+/// The compare's shader, compiled once from [`CARD_COMPARE`] (`cs_5_1`,
+/// `main`) by a real `d3dcompiler_47`: 2,248 bytes. The compiler that
+/// answers in this program's environment is not one -- `d3dcompiler_47.dll`
+/// beside the program there replies `E_FAIL` with no message to every
+/// `D3DCompile`, a one-line `RWByteAddressBuffer` store included -- so what
+/// a compiler made of the source once is kept here, and is used when the
+/// one at hand cannot make it. The source above stays the definition: change
+/// it and this must be compiled again.
+const CARD_COMPARE_DXBC: &[u8] = &[
+    0x44, 0x58, 0x42, 0x43, 0xa6, 0x70, 0xb6, 0x58, 0xa9, 0xd4, 0x86, 0xe9,
+    0xf9, 0x87, 0x90, 0xea, 0x1f, 0x8a, 0x6b, 0xd5, 0x01, 0x00, 0x00, 0x00,
+    0xc8, 0x08, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x38, 0x00, 0x00, 0x00,
+    0xb4, 0x02, 0x00, 0x00, 0xc4, 0x02, 0x00, 0x00, 0xd4, 0x02, 0x00, 0x00,
+    0xac, 0x07, 0x00, 0x00, 0x48, 0x08, 0x00, 0x00, 0x52, 0x44, 0x45, 0x46,
+    0x74, 0x02, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0xf4, 0x00, 0x00, 0x00,
+    0x04, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x00, 0x00, 0x01, 0x05, 0x53, 0x43,
+    0x00, 0x05, 0x00, 0x00, 0x4c, 0x02, 0x00, 0x00, 0x13, 0x13, 0x44, 0x25,
+    0x3c, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x28, 0x00, 0x00, 0x00,
+    0x28, 0x00, 0x00, 0x00, 0x24, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0xdc, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00,
+    0x06, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe0, 0x00, 0x00, 0x00,
+    0x08, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xe7, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0xef, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x6e, 0x6f, 0x77, 0x00,
+    0x68, 0x61, 0x73, 0x68, 0x65, 0x73, 0x00, 0x64, 0x69, 0x66, 0x66, 0x65,
+    0x72, 0x73, 0x00, 0x53, 0x70, 0x61, 0x6e, 0x00, 0xef, 0x00, 0x00, 0x00,
+    0x06, 0x00, 0x00, 0x00, 0x0c, 0x01, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfc, 0x01, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+    0x08, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
+    0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00,
+    0x2c, 0x02, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
+    0x02, 0x00, 0x00, 0x00, 0x08, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
+    0x00, 0x00, 0x00, 0x00, 0x31, 0x02, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00,
+    0x04, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x08, 0x02, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00,
+    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x36, 0x02, 0x00, 0x00,
+    0x0c, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+    0x08, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
+    0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00,
+    0x3d, 0x02, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
+    0x02, 0x00, 0x00, 0x00, 0x08, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
+    0x00, 0x00, 0x00, 0x00, 0x44, 0x02, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00,
+    0x04, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x08, 0x02, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00,
+    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x66, 0x69, 0x72, 0x73,
+    0x74, 0x00, 0x64, 0x77, 0x6f, 0x72, 0x64, 0x00, 0x00, 0x00, 0x13, 0x00,
+    0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x02, 0x02, 0x00, 0x00, 0x73, 0x6b, 0x65, 0x77,
+    0x00, 0x73, 0x69, 0x7a, 0x65, 0x00, 0x70, 0x69, 0x65, 0x63, 0x65, 0x73,
+    0x00, 0x6f, 0x75, 0x74, 0x5f, 0x61, 0x74, 0x00, 0x63, 0x6f, 0x6d, 0x70,
+    0x61, 0x72, 0x65, 0x00, 0x4d, 0x69, 0x63, 0x72, 0x6f, 0x73, 0x6f, 0x66,
+    0x74, 0x20, 0x28, 0x52, 0x29, 0x20, 0x48, 0x4c, 0x53, 0x4c, 0x20, 0x53,
+    0x68, 0x61, 0x64, 0x65, 0x72, 0x20, 0x43, 0x6f, 0x6d, 0x70, 0x69, 0x6c,
+    0x65, 0x72, 0x20, 0x31, 0x30, 0x2e, 0x31, 0x00, 0x49, 0x53, 0x47, 0x4e,
+    0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00,
+    0x4f, 0x53, 0x47, 0x4e, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x08, 0x00, 0x00, 0x00, 0x53, 0x48, 0x45, 0x58, 0xd0, 0x04, 0x00, 0x00,
+    0x51, 0x00, 0x05, 0x00, 0x34, 0x01, 0x00, 0x00, 0x6a, 0x08, 0x00, 0x01,
+    0x59, 0x00, 0x00, 0x07, 0x46, 0x8e, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0xa1, 0x00, 0x00, 0x06, 0x46, 0x7e, 0x30, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x9d, 0x00, 0x00, 0x06, 0x46, 0xee, 0x31, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x9d, 0x00, 0x00, 0x06, 0x46, 0xee, 0x31, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x5f, 0x00, 0x00, 0x02, 0x12, 0x00, 0x02, 0x00,
+    0x68, 0x00, 0x00, 0x02, 0x04, 0x00, 0x00, 0x00, 0x9b, 0x00, 0x00, 0x04,
+    0x40, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x50, 0x00, 0x00, 0x08, 0x12, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x0a, 0x00, 0x02, 0x00, 0x3a, 0x80, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1f, 0x00, 0x04, 0x03,
+    0x0a, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3e, 0x00, 0x00, 0x01,
+    0x15, 0x00, 0x00, 0x01, 0x1e, 0x00, 0x00, 0x08, 0x12, 0x00, 0x10, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x02, 0x00, 0x0a, 0x80, 0x30, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x29, 0x00, 0x00, 0x07, 0x22, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x0a, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x40, 0x00, 0x00,
+    0x10, 0x00, 0x00, 0x00, 0x4f, 0x00, 0x00, 0x09, 0x42, 0x00, 0x10, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x1a, 0x80, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1a, 0x00, 0x10, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x1e, 0x00, 0x00, 0x0a, 0x22, 0x00, 0x10, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x1a, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x1a, 0x80, 0x30, 0x80, 0x41, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x07,
+    0x42, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1a, 0x00, 0x10, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x2a, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x1e, 0x00, 0x00, 0x07, 0x22, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x1a, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x40, 0x00, 0x00,
+    0x00, 0x00, 0x01, 0x00, 0x54, 0x00, 0x00, 0x09, 0x22, 0x00, 0x10, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x1a, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x2a, 0x80, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x1e, 0x00, 0x00, 0x07, 0x22, 0x00, 0x10, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x1a, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x40, 0x00, 0x00, 0x0f, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x0a,
+    0x62, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x56, 0x06, 0x10, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x02, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xf0, 0xff, 0xff, 0xff, 0xf0, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00,
+    0x36, 0x00, 0x00, 0x08, 0xf2, 0x00, 0x10, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x02, 0x40, 0x00, 0x00, 0xb9, 0x79, 0x37, 0x9e, 0x6b, 0xca, 0xeb, 0x85,
+    0x35, 0xae, 0xb2, 0xc2, 0x2f, 0xeb, 0xd4, 0x27, 0x36, 0x00, 0x00, 0x05,
+    0x82, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2a, 0x00, 0x10, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x30, 0x00, 0x00, 0x01, 0x50, 0x00, 0x00, 0x07,
+    0x12, 0x00, 0x10, 0x00, 0x02, 0x00, 0x00, 0x00, 0x3a, 0x00, 0x10, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x1a, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x03, 0x00, 0x04, 0x03, 0x0a, 0x00, 0x10, 0x00, 0x02, 0x00, 0x00, 0x00,
+    0xa5, 0x00, 0x00, 0x08, 0xf2, 0x00, 0x10, 0x00, 0x02, 0x00, 0x00, 0x00,
+    0x3a, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46, 0x7e, 0x20, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x57, 0x00, 0x00, 0x07,
+    0xf2, 0x00, 0x10, 0x00, 0x02, 0x00, 0x00, 0x00, 0x96, 0x03, 0x10, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x96, 0x03, 0x10, 0x00, 0x02, 0x00, 0x00, 0x00,
+    0x26, 0x00, 0x00, 0x0b, 0x00, 0xd0, 0x00, 0x00, 0xf2, 0x00, 0x10, 0x00,
+    0x02, 0x00, 0x00, 0x00, 0x46, 0x0e, 0x10, 0x00, 0x02, 0x00, 0x00, 0x00,
+    0x02, 0x40, 0x00, 0x00, 0xb1, 0x79, 0x37, 0x9e, 0x77, 0xca, 0xeb, 0x85,
+    0x3d, 0xae, 0xb2, 0xc2, 0x93, 0x01, 0x00, 0x01, 0x55, 0x00, 0x00, 0x0a,
+    0xf2, 0x00, 0x10, 0x00, 0x03, 0x00, 0x00, 0x00, 0x36, 0x09, 0x10, 0x00,
+    0x02, 0x00, 0x00, 0x00, 0x02, 0x40, 0x00, 0x00, 0x0f, 0x00, 0x00, 0x00,
+    0x0f, 0x00, 0x00, 0x00, 0x0f, 0x00, 0x00, 0x00, 0x0f, 0x00, 0x00, 0x00,
+    0x57, 0x00, 0x00, 0x07, 0xf2, 0x00, 0x10, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x46, 0x0e, 0x10, 0x00, 0x02, 0x00, 0x00, 0x00, 0x46, 0x0e, 0x10, 0x00,
+    0x03, 0x00, 0x00, 0x00, 0x1e, 0x00, 0x00, 0x07, 0x82, 0x00, 0x10, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x3a, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x40, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x16, 0x00, 0x00, 0x01,
+    0x1f, 0x00, 0x04, 0x05, 0x1a, 0x80, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x29, 0x00, 0x00, 0x06,
+    0x22, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x02, 0x00,
+    0x01, 0x40, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x1e, 0x00, 0x00, 0x09,
+    0x22, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1a, 0x00, 0x10, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x0a, 0x80, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x29, 0x00, 0x00, 0x07,
+    0x42, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x10, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x01, 0x40, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
+    0xa5, 0x00, 0x00, 0x08, 0xf2, 0x00, 0x10, 0x00, 0x02, 0x00, 0x00, 0x00,
+    0x2a, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46, 0xee, 0x21, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x27, 0x00, 0x00, 0x07,
+    0xf2, 0x00, 0x10, 0x00, 0x02, 0x00, 0x00, 0x00, 0x46, 0x0e, 0x10, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x46, 0x0e, 0x10, 0x00, 0x02, 0x00, 0x00, 0x00,
+    0x3c, 0x00, 0x00, 0x07, 0x32, 0x00, 0x10, 0x00, 0x02, 0x00, 0x00, 0x00,
+    0xe6, 0x0a, 0x10, 0x00, 0x02, 0x00, 0x00, 0x00, 0x46, 0x00, 0x10, 0x00,
+    0x02, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x00, 0x07, 0x82, 0x00, 0x10, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x1a, 0x00, 0x10, 0x00, 0x02, 0x00, 0x00, 0x00,
+    0x0a, 0x00, 0x10, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x07,
+    0x82, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3a, 0x00, 0x10, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x01, 0x40, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0xa6, 0x00, 0x00, 0x08, 0x12, 0xe0, 0x21, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x1a, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x3a, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x09,
+    0x22, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1a, 0x80, 0x30, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x01, 0x40, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x1f, 0x00, 0x04, 0x03,
+    0x1a, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0xa6, 0x00, 0x00, 0x08,
+    0xf2, 0xe0, 0x21, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x2a, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46, 0x0e, 0x10, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x15, 0x00, 0x00, 0x01, 0x12, 0x00, 0x00, 0x01,
+    0x29, 0x00, 0x00, 0x07, 0x12, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x0a, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x40, 0x00, 0x00,
+    0x04, 0x00, 0x00, 0x00, 0xa6, 0x00, 0x00, 0x08, 0xf2, 0xe0, 0x21, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x10, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x46, 0x0e, 0x10, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x15, 0x00, 0x00, 0x01, 0x3e, 0x00, 0x00, 0x01, 0x53, 0x54, 0x41, 0x54,
+    0x94, 0x00, 0x00, 0x00, 0x2c, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x0d, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
+    0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x52, 0x54, 0x53, 0x30,
+    0x78, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
+    0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x78, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x48, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x54, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x60, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x6c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,
+];
+
+/// Where [`Host::card_ready`] got to. The first ask can come before the
+/// device is warm (the first compute pipeline it compiles, the first buffer
+/// it maps), so a failure there is not the last word: it is tried again
+/// [`card_retries`] times, [`CARD_RETRY`] apart.
+#[derive(Clone, Copy)]
+enum CardState {
+    /// Not tried yet.
+    Untried,
+    /// The compare is made.
+    Ready,
+    /// Tried, failed, and due no earlier than the instant inside.
+    Waiting(Instant),
+    /// Tried often enough: the run's looks are made on the CPU.
+    GivenUp,
+}
+
+static CARD_READY: Mutex<CardState> = Mutex::new(CardState::Untried);
+static CARD_TRIES: AtomicU32 = AtomicU32::new(0);
+
+/// How long after a failure [`Host::card_ready`] tries again.
+const CARD_RETRY: Duration = Duration::from_secs(5);
+
+/// How many times the compare is tried after a failure
+/// (`VICTORY_CARD_RETRIES`, four by default: five tries, 5 s apart).
+fn card_retries() -> u32 {
+    static ON: OnceLock<u32> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("VICTORY_CARD_RETRIES")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(4)
+    })
+}
+
+/// Whether [`Host::make_card_work`] says which step it is on
+/// (`VICTORY_CARD_DEBUG=1`); a step that fails is named either way.
+fn card_debug() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_DEBUG").is_some_and(|v| v != "0"))
+}
+
+/// One step of [`Host::make_card_work`], named in the log with its HRESULT
+/// when it fails (and, with [`card_debug`], as it is taken).
+fn card_step<T>(what: &str, step: impl FnOnce() -> windows::core::Result<T>) -> windows::core::Result<T> {
+    if card_debug() {
+        tracing::info!(target: "victory_gpu::host::card", "the compare: {what}");
+    }
+    let taken = step();
+    match &taken {
+        Ok(_) => {
+            if card_debug() {
+                tracing::info!(target: "victory_gpu::host::card", "the compare: {what}: done");
+            }
+        }
+        Err(e) => tracing::error!(
+            target: "victory_gpu::host::card",
+            error = %e,
+            hresult = %format_args!("0x{:08X}", e.code().0 as u32),
+            "the compare: {what} failed"
+        ),
+    }
+    taken
+}
+
+/// The message a compiler or a serializer put in a blob, in the log.
+fn card_blob_note(what: &str, blob: Option<&windows::Win32::Graphics::Direct3D::ID3DBlob>) {
+    let Some(blob) = blob else {
+        return;
+    };
+    // SAFETY: the blob's own bytes.
+    let text = unsafe {
+        let at = blob.GetBufferPointer().cast::<u8>();
+        let len = blob.GetBufferSize();
+        String::from_utf8_lossy(std::slice::from_raw_parts(at, len)).into_owned()
+    };
+    let text = text.trim_end();
+    if !text.is_empty() {
+        tracing::error!(target: "victory_gpu::host::card", "{what}: {text}");
+    }
+}
+
+/// The compare's compiled shader, in the current directory, for looking at
+/// outside the run (`VICTORY_CARD_DEBUG=1`).
+fn card_blob_dump(bytes: &[u8]) {
+    if !card_debug() {
+        return;
+    }
+    match std::fs::write("victory-card-compare.cso", bytes) {
+        Ok(()) => tracing::info!(
+            target: "victory_gpu::host::card",
+            bytes = bytes.len(),
+            "the compare's shader written to victory-card-compare.cso"
+        ),
+        Err(e) => tracing::warn!(error = %e, "the compare's shader could not be written out"),
+    }
+}
+
 impl Host {
     /// Whether the host runs mesh shaders at shader model 6.6 (translated
     /// mesh shaders need both); logged once.
@@ -2930,6 +3550,8 @@ impl Host {
             if !lazy_prelude() {
                 let _ = prelude.set(self.make_prelude());
             }
+            let id = NEXT_LIST.fetch_add(1, Ordering::Relaxed);
+            name(&list, || list_name(id));
             Ok(HostList {
                 allocator,
                 list,
@@ -2939,6 +3561,7 @@ impl Host {
                 twins: Mutex::default(),
                 prelude,
                 pipelines: Mutex::default(),
+                id,
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
                 _alive: Counted::new(),
@@ -2993,74 +3616,240 @@ impl Host {
     }
 
     /// Whether the host has what copies in the card's memory need (three
-    /// lists and the compare); made at the first ask. A copy goes to the
-    /// card's memory only if it has.
+    /// lists and the compare); made at the first ask, and tried again after
+    /// a failure ([`card_retries`]). A copy goes to the card's memory only
+    /// if it has.
     pub(crate) fn card_ready(&self) -> bool {
-        static READY: OnceLock<bool> = OnceLock::new();
-        *READY.get_or_init(|| match self.make_card_work() {
+        let mut state = CARD_READY.lock().unwrap_or_else(|e| e.into_inner());
+        let due = match *state {
+            CardState::Ready => return true,
+            CardState::GivenUp => return false,
+            CardState::Untried => true,
+            CardState::Waiting(at) => Instant::now() >= at,
+        };
+        if !due {
+            return false;
+        }
+        match self.make_card_work() {
             Ok(work) => {
                 *CARD_WORK.lock().unwrap_or_else(|e| e.into_inner()) = Some(work);
+                *state = CardState::Ready;
+                tracing::info!(
+                    "the compare is made: what shaders write to host copies in the card's memory is looked for on the card"
+                );
                 true
             }
             Err(e) => {
-                tracing::warn!(error = %e, "no host copies in the card's memory: the compare could not be made");
+                let tries = CARD_TRIES.fetch_add(1, Ordering::Relaxed) + 1;
+                if tries > card_retries() {
+                    *state = CardState::GivenUp;
+                    tracing::warn!(
+                        error = %e,
+                        tries,
+                        "no host copies in the card's memory: the compare could not be made and the tries are spent: every look a shader's writes ask for is made on the CPU for the rest of the run"
+                    );
+                } else {
+                    *state = CardState::Waiting(Instant::now() + CARD_RETRY);
+                    tracing::warn!(
+                        error = %e,
+                        tries,
+                        retry_secs = CARD_RETRY.as_secs(),
+                        "no host copies in the card's memory: the compare could not be made; tried again after that (VICTORY_CARD_RETRIES)"
+                    );
+                }
                 false
             }
-        })
+        }
     }
 
     fn make_card_work(&self) -> windows::core::Result<CardWork> {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
         let mut code: Option<ID3DBlob> = None;
-        // SAFETY: the source and names live through the call; the out
-        // pointer is ours.
-        unsafe {
-            D3DCompile(
-                CARD_COMPARE.as_ptr().cast(),
-                CARD_COMPARE.len(),
-                windows::core::s!("card compare"),
-                None,
-                None,
-                windows::core::s!("main"),
-                windows::core::s!("cs_5_1"),
-                0,
-                0,
-                &mut code,
-                None,
-            )?;
-        }
-        let code = code.ok_or_else(windows::core::Error::empty)?;
+        let mut why: Option<ID3DBlob> = None;
+        let compiled = card_step("D3DCompile, cs_5_1, the compare", || {
+            // SAFETY: the source and names live through the call; the out
+            // pointers are ours.
+            unsafe {
+                D3DCompile(
+                    CARD_COMPARE.as_ptr().cast(),
+                    CARD_COMPARE.len(),
+                    windows::core::s!("card compare"),
+                    None,
+                    None,
+                    windows::core::s!("main"),
+                    windows::core::s!("cs_5_1"),
+                    0,
+                    0,
+                    &mut code,
+                    Some(&mut why),
+                )
+            }
+        })
+        .and_then(|()| code.ok_or_else(windows::core::Error::empty));
+        card_blob_note("the compiler's message", why.as_ref());
+        let blob = match compiled {
+            Ok(blob) => {
+                // SAFETY: the blob's own size.
+                let bytes = unsafe { blob.GetBufferSize() };
+                tracing::info!(from = "D3DCompile", bytes, "the compare's shader is compiled here");
+                Some(blob)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    from = "embedded",
+                    bytes = CARD_COMPARE_DXBC.len(),
+                    "the compare's shader was not compiled here: the copy of it a compiler made is used instead"
+                );
+                None
+            }
+        };
         let list = || self.make_prelude().ok_or_else(windows::core::Error::empty);
         // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
         // in one submission.
         const RESULTS: u64 = 1 << 20;
-        let (differs, data) = self.shared_buffer(RESULTS).ok_or_else(windows::core::Error::empty)?;
+        let (differs, data) = card_step("a megabyte of results", || {
+            self.shared_buffer(RESULTS).ok_or_else(windows::core::Error::empty)
+        })?;
         name(&differs, || "card compare results".into());
-        // SAFETY: the blob's own bytes; the root signature is inside the
-        // shader.
-        unsafe {
-            let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-            let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
-            let pso: ID3D12PipelineState = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                pRootSignature: std::mem::transmute_copy(&root),
-                CS: D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: bytes.as_ptr().cast(),
-                    BytecodeLength: bytes.len(),
-                },
-                ..Default::default()
+        let [sync, check, fetch] = card_step("three lists of ours", || Ok([list()?, list()?, list()?]))?;
+        // SAFETY: the blob's bytes live through both calls (the blob is
+        // ours, and outlives them), and so do the structures they are
+        // handed.
+        let (root, pso) = unsafe {
+            let bytes: &[u8] = match &blob {
+                Some(blob) => std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize()),
+                None => CARD_COMPARE_DXBC,
+            };
+            card_blob_dump(bytes);
+            if card_debug() {
+                // A shader's bytes are a DXBC container, not a root
+                // signature: said here, once, as the measurement of it.
+                match self.device.CreateRootSignature::<ID3D12RootSignature>(0, bytes) {
+                    Ok(_) => tracing::warn!("the card's d3d12 took a shader's bytes as a root signature: it checks nothing"),
+                    Err(e) => tracing::info!(
+                        target: "victory_gpu::host::card",
+                        error = %e,
+                        hresult = %format_args!("0x{:08X}", e.code().0 as u32),
+                        "a shader's bytes as a root signature, refused (as it must be)"
+                    ),
+                }
+            }
+            let root = card_step("CreateRootSignature, over the serialized one", || self.make_card_root())?;
+            let pso = card_step("CreateComputePipelineState", || {
+                self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr().cast(),
+                        BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                })
             })?;
-            Ok(CardWork {
-                sync: vec![list()?],
-                check: vec![list()?],
-                fetch: list()?,
-                root,
-                pso,
-                differs: (differs, data as usize, RESULTS),
-                fetched: None,
-                taken: 0,
-                out: 0,
-            })
+            (root, pso)
+        };
+        Ok(CardWork {
+            sync: vec![sync],
+            check: vec![check],
+            fetch,
+            root,
+            pso,
+            differs: (differs, data as usize, RESULTS),
+            fetched: None,
+            taken: 0,
+            out: 0,
+        })
+    }
+
+    /// The root signature the compare's shader is written for
+    /// (`RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)`,
+    /// which its `[RootSignature]` attribute says too), serialized as D3D12
+    /// takes root signatures. A shader's bytes are not one: the card's
+    /// D3D12 reads the first dword as the version of a serialized
+    /// signature, and a shader starts with `DXBC`, so it refuses them.
+    fn make_card_root(&self) -> windows::core::Result<ID3D12RootSignature> {
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        let descriptor = |register: u32| D3D12_ROOT_PARAMETER_0 {
+            // SAFETY: a plain union, written and read as the parameter
+            // type says.
+            Descriptor: D3D12_ROOT_DESCRIPTOR {
+                ShaderRegister: register,
+                RegisterSpace: 0,
+            },
+        };
+        let parameters = [
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    Constants: D3D12_ROOT_CONSTANTS {
+                        ShaderRegister: 0,
+                        RegisterSpace: 0,
+                        Num32BitValues: 6,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                Anonymous: descriptor(0),
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+                Anonymous: descriptor(0),
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+                Anonymous: descriptor(1),
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+        ];
+        let desc = D3D12_ROOT_SIGNATURE_DESC {
+            NumParameters: parameters.len() as u32,
+            pParameters: parameters.as_ptr(),
+            NumStaticSamplers: 0,
+            pStaticSamplers: std::ptr::null(),
+            Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+        };
+        let mut serialized: Option<ID3DBlob> = None;
+        let mut why: Option<ID3DBlob> = None;
+        // SAFETY: the desc and its arrays live through the call; the out
+        // pointers are ours.
+        let versioned = unsafe {
+            D3D12SerializeVersionedRootSignature(
+                &D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+                    Version: D3D_ROOT_SIGNATURE_VERSION_1,
+                    Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 { Desc_1_0: desc },
+                },
+                &mut serialized,
+                Some(&mut why),
+            )
+        };
+        if versioned.is_err() || serialized.is_none() {
+            card_blob_note("the serializer's message", why.as_ref());
+            // The older export, which some d3d12 implementations have and
+            // this one may not.
+            let mut why = None;
+            // SAFETY: as above.
+            unsafe {
+                D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut serialized, Some(&mut why))?;
+            }
+            card_blob_note("the serializer's message", why.as_ref());
+        }
+        let serialized = serialized.ok_or_else(windows::core::Error::empty)?;
+        // SAFETY: the blob's own bytes, which live through the call.
+        unsafe {
+            let bytes = std::slice::from_raw_parts(serialized.GetBufferPointer().cast::<u8>(), serialized.GetBufferSize());
+            if card_debug() {
+                tracing::info!(
+                    target: "victory_gpu::host::card",
+                    bytes = bytes.len(),
+                    "the compare's root signature, serialized"
+                );
+            }
+            self.device.CreateRootSignature(0, bytes)
         }
     }
 
@@ -4078,6 +4867,15 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::SnapshotUs, snapshots.elapsed().as_micros() as u64);
         }
+        // The ranges it declared are the card's from here on: a later
+        // refresh leaves them alone until they are copied back.
+        for list in runs {
+            for step in &list.deferred().copies {
+                if let Step::GpuWrite(shadow, ..) = step {
+                    shadow.writes_sent();
+                }
+            }
+        }
         // Copies in the card's memory: what changed on their CPU side goes
         // up ahead of the lists, and a compare of what the shaders may
         // write follows them in the same submission.
@@ -4316,19 +5114,47 @@ impl Host {
                     return text;
                 }
             };
-            // Every list's progress (done/count), in the runtime's order.
-            let mut progress = Vec::new();
+            // The nodes, oldest list first, and which run each is.
+            let mut nodes = Vec::new();
             let mut node = crumbs.pHeadAutoBreadcrumbNode;
             while let Some(p) = node.as_ref() {
-                let done = p.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
-                let ours = p.pCommandList.as_ref().map(|l| l.as_raw());
-                let index = runs.iter().position(|r| Some(r.list.as_raw()) == ours);
-                progress.push(format!("{done}/{} {index:?}", p.BreadcrumbCount));
+                nodes.push(p);
                 node = p.pNext;
             }
+            let index: Vec<Option<usize>> = nodes
+                .iter()
+                .map(|p| runs.iter().position(|r| r.is_node(p)))
+                .collect();
+            if let Some(last) = nodes.last()
+                && index.iter().all(Option::is_none)
+            {
+                let name = |w: windows::core::PCWSTR, a: *const u8| {
+                    let w = (!w.is_null()).then(|| w.to_string().unwrap_or_default());
+                    let a = (!a.is_null()).then(|| {
+                        std::ffi::CStr::from_ptr(a.cast())
+                            .to_string_lossy()
+                            .into_owned()
+                    });
+                    format!("{w:?}/{a:?}")
+                };
+                tracing::warn!(
+                    nodes = nodes.len(),
+                    last_pointer = ?last.pCommandList.as_ref().map(|l| l.as_raw()),
+                    last_names = %name(last.pCommandListDebugNameW, last.pCommandListDebugNameA),
+                    "no breadcrumb node named one of our lists"
+                );
+            }
+            // Every list's progress (done/count), in the runtime's order.
+            let progress: Vec<String> = nodes
+                .iter()
+                .zip(&index)
+                .map(|(p, index)| {
+                    let done = p.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
+                    format!("{done}/{} {index:?}", p.BreadcrumbCount)
+                })
+                .collect();
             text.push_str(&format!("; breadcrumbs (done/count, list) {progress:?}"));
-            let mut plain = crumbs.pHeadAutoBreadcrumbNode;
-            while let Some(p) = plain.as_ref() {
+            for (p, index) in nodes.iter().zip(&index) {
                 let done = p.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
                 if done < p.BreadcrumbCount && !p.pCommandHistory.is_null() {
                     let history =
@@ -4337,8 +5163,7 @@ impl Host {
                         "; a list stopped at command {done} of {} (op {})",
                         p.BreadcrumbCount, history[done as usize].0
                     ));
-                    let list = p.pCommandList.as_ref().map(|l| l.as_raw());
-                    let run = runs.iter().find(|r| Some(r.list.as_raw()) == list);
+                    let run = index.map(|i| runs[i]);
                     // The k-th marker command is the k-th note.
                     #[cfg(feature = "diagnostics")]
                     let markers: Vec<(u32, String)> = run.map_or_else(Vec::new, |r| {
@@ -4365,7 +5190,6 @@ impl Host {
                         text.push_str(&format!(", its pipelines {pipelines:?}"));
                     }
                 }
-                plain = p.pNext;
             }
         }
         text
@@ -4515,6 +5339,28 @@ impl HostList {
         times.sort_by(|a, b| b.0.total_cmp(&a.0));
         times.truncate(n);
         times
+    }
+
+    /// Whether `node` of the device-removed data (its breadcrumbs) is this
+    /// list.
+    fn is_node(&self, node: &D3D12_AUTO_BREADCRUMB_NODE) -> bool {
+        // SAFETY: only the pointer and the name text are read: the pointer is
+        // compared, never used, and the name is the runtime's copy.
+        let (pointer, wide, ansi) = unsafe {
+            (
+                node.pCommandList.as_ref().map(|l| l.as_raw() as usize),
+                (!node.pCommandListDebugNameW.is_null())
+                    .then(|| node.pCommandListDebugNameW.to_string().unwrap_or_default()),
+                (!node.pCommandListDebugNameA.is_null()).then(|| {
+                    std::ffi::CStr::from_ptr(node.pCommandListDebugNameA.cast())
+                        .to_string_lossy()
+                        .into_owned()
+                }),
+            )
+        };
+        let (pointers, name) = (identities(&self.list), list_name(self.id));
+        node_is_list(pointer, wide.as_deref(), &pointers, &name)
+            || node_is_list(None, ansi.as_deref(), &pointers, &name)
     }
 
     pub(crate) fn close(&self) {
@@ -5055,7 +5901,7 @@ impl HostList {
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
         let host = host()?;
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
-        let len = len.max(1).next_multiple_of(256);
+        let len = len.max(1).checked_next_multiple_of(256)?;
         if len > SCRATCH_CHUNK {
             let (buffer, data) = host.upload_buffer(len)?;
             name(&buffer, || format!("list scratch {len:#x}"));
@@ -5065,17 +5911,22 @@ impl HostList {
             return Some((gpu, data));
         }
         // The chunk in use while `len` fits in what is left of it, else the
-        // next one (a list's first chunk may be a small one).
+        // next one (the chunks of shared scratch grow).
         while s.current < s.chunks.len() && s.used + len > s.chunks[s.current].1 {
             (s.current, s.used) = (s.current + 1, 0);
         }
         if s.current == s.chunks.len() {
-            let size = if scratch_pool() && s.chunks.is_empty() && len <= SCRATCH_FIRST {
-                SCRATCH_FIRST
+            let size = if scratch_pool() {
+                // Powers of two, so that kept chunks fit the next list's asks.
+                let next = s.chunks.last().map_or(SCRATCH_FIRST, |c| 2 * c.1);
+                next.max(len.next_power_of_two()).min(SCRATCH_CHUNK)
             } else {
                 SCRATCH_CHUNK
             };
             let chunk = take_chunk(host, size)?;
+            #[cfg(feature = "diagnostics")]
+            tracing::debug!(target: "victory_gpu::scratch", list = ?std::ptr::from_ref(self),
+                chunk = s.current, requested = len, size, "took list scratch");
             s.chunks.push((chunk, size));
             s.used = 0;
         }
@@ -5340,6 +6191,19 @@ impl Batch {
         let started = std::time::Instant::now();
         let copied = shadow.update(from, to - from);
         let us = started.elapsed().as_micros() as u64;
+        if report_copies() {
+            // The buffer this copy was for: its title range and what the
+            // copy cost (the ledger merges the ranges per buffer).
+            let (start, len) = (from as u64, (to - from) as u64);
+            let mut ledger = COPY_WHERE.lock().unwrap_or_else(|e| e.into_inner());
+            match ledger.iter_mut().find(|e| (e.0, e.1) == (start, len)) {
+                Some(entry) => {
+                    entry.2 += us;
+                    entry.3 += copied as u64;
+                }
+                None => ledger.push((start, len, us, copied as u64)),
+            }
+        }
         #[cfg(feature = "diagnostics")]
         crate::copystat::range(from, to - from, us, 0);
         PREPARING[0].fetch_add(us, Ordering::Relaxed);
@@ -5403,12 +6267,14 @@ impl Batch {
 /// Copies title memory at submission. The ranges were checked against their
 /// resources when recorded, but the title may since have unmapped pages of
 /// them (tiled memory, page mappings), which read as zeros here; a title
-/// destination (`title_dst`) that is not all mapped is left alone.
+/// destination (`title_dst`) that is not all mapped takes nothing from its
+/// first unmapped page on.
 ///
-/// The source is read through the kernel (`ReadProcessMemory`), which
-/// reports an unmapped page instead of faulting. Asking `VirtualQuery` first
-/// cost about 2 ms per copy in the title's big pools (it walks the page
-/// tables to the region's end), which made copies run at 100-200 MB/s.
+/// The copy runs in the kernel (`ReadProcessMemory`), which reports an
+/// unmapped page of the source, or of the destination it writes, instead of
+/// faulting. Asking `VirtualQuery` first cost about 2 ms per copy in the
+/// title's big pools (it walks the page tables to the region's end), which
+/// made copies run at 100-200 MB/s.
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
@@ -5423,7 +6289,8 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if len == 0 {
         return;
     }
-    // A title destination that is not all mapped is left alone. Asking
+    // A title destination that is not all mapped takes nothing from its first
+    // unmapped page on (with `VICTORY_COPY_ASK=1`, nothing at all). Asking
     // Windows first (`VirtualQuery`) walks the page tables to the end of
     // the destination's region: in the title's big blocks that is
     // milliseconds a copy, and it was a seventh of the submitting thread's
@@ -5439,6 +6306,32 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if title_dst {
         // The kernel writes the destination: it must not be guarded.
         crate::watch::writing(dst as usize, len);
+    }
+    probe(probe::RANGES, 1);
+    probe(probe::BYTES, len as u64);
+    if len >= 1 << 20 {
+        probe(probe::BIG, 1);
+    }
+    // A host destination, pages asked page by page: one pass over the source
+    // (`read_holes`), which is the whole copy — the runs that can be read
+    // copied in place, the pages that are not there written as zeros. The
+    // same bytes `read` and the walk behind it gave, without asking the
+    // source twice, without the kernel's whole read of a range that has a
+    // hole in it, and without `read_sparse`'s second walk of the regions.
+    if !title_dst && len >= 64 << 10 && pages_ask() {
+        let ask = std::time::Instant::now();
+        let ours = writable(dst as usize, len);
+        probe(probe::DST_US, ask.elapsed().as_micros() as u64);
+        probe(probe::DST_REGIONS, 1);
+        if ours {
+            let moved = std::time::Instant::now();
+            probe(probe::SRC_PAGES_CALLS, 1);
+            read_holes(src, dst, len);
+            probe(probe::IN_PLACE_US, moved.elapsed().as_micros() as u64);
+            probe(probe::IN_PLACE, 1);
+            probe(probe::IN_PLACE_BYTES, len as u64);
+            return;
+        }
     }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
@@ -5456,19 +6349,61 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
-    #[cfg(feature = "diagnostics")]
+    probe(probe::FALLBACKS, 1);
+    probe(probe::FAILED_BYTES, len as u64);
     let sparse = std::time::Instant::now();
-    if !title_dst && len >= 64 << 10 {
+    if !title_dst && len >= 64 << 10 && pages_ask() {
+        // One pass: the same bytes the region walk below gives (a page that
+        // cannot be read is zeros there too), asked page by page.
+        read_holes(src, dst, len);
+    } else if !title_dst && len >= 64 << 10 {
         read_sparse(src, dst, len);
     } else {
         read_pieces(src, dst, len);
     }
-    #[cfg(feature = "diagnostics")]
-    crate::copystat::add(crate::copystat::C::SparseUs, sparse.elapsed().as_micros() as u64);
+    probe(probe::FALLBACK_US, sparse.elapsed().as_micros() as u64);
+}
+
+/// A host destination's copy, in one pass over the kernel's pages of
+/// `[src, src + len)`: the runs that can be read are copied in place, the
+/// rest is written as zeros. [`copy_mapped`]'s whole job for that direction,
+/// and [`read_sparse`]'s place when it does not take it.
+///
+/// The bytes are [`read_sparse`]'s: a run of pages it took for unmapped is
+/// written as zeros there, and one it took for mapped but could not read
+/// (a guard page, a page no one may read) it zeroes as well, through
+/// `read_pieces` — here the page's own answer is the same question asked
+/// cheaper. What it costs is the difference: `read_sparse` asked
+/// `VirtualQuery` of every region (0.6 ms a question in the title's big
+/// pools, and the copies of one world frame met 98 MB of them), and each
+/// region that could be read asked twice more, in `read`.
+///
+/// The memory may change while the walk runs (the title remaps pages): a run
+/// read as there is copied as `read` copies any range it was told is there,
+/// and one that went away between the answer and the copy is a plain copy's
+/// fault — the same exposure as the copy above.
+fn read_holes(src: *const u8, dst: *mut u8, len: usize) {
+    let base = src as usize;
+    crate::texture::page_runs(base, len, |offset, bytes, _, readable| {
+        // SAFETY: `offset + bytes` lies inside the caller's two mappings,
+        // and a run the walk found readable may be copied (the byte read it
+        // made took any guard of it).
+        unsafe {
+            let to = dst.add(offset);
+            if readable {
+                std::ptr::copy_nonoverlapping(src.add(offset), to, bytes);
+            } else {
+                probe(probe::ZERO_BYTES, bytes as u64);
+                to.write_bytes(0, bytes);
+            }
+        }
+        true
+    });
 }
 
 /// After a failed bulk read into host memory, skip contiguous holes. Never
 /// cache the query across copies: the title may remap the same address.
+/// `VICTORY_READ_PAGES=0` keeps this walk (see [`pages_ask`]).
 fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery,
@@ -5490,6 +6425,7 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
         if info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
+            probe(probe::ZERO_BYTES, n as u64);
             // SAFETY: this path is only used with a writable host destination.
             unsafe { to.write_bytes(0, n) };
         } else if !read(at, to, n) {
@@ -5511,6 +6447,7 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
                 if !read(at as *const u8, to, n) {
                     #[cfg(feature = "diagnostics")]
                     crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
+                    probe(probe::ZERO_BYTES, n as u64);
                     // SAFETY: inside the destination, which is mapped.
                     unsafe { to.write_bytes(0, n) };
                 }
@@ -5526,14 +6463,367 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 }
 
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
-/// readable.
+/// readable. The common case (both ends this process's own committed,
+/// readable and writable memory) is copied in user space; the kernel is
+/// asked for the rest, because it reports a short copy where a plain copy
+/// would fault.
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    // `ReadProcessMemory` is a system call whose cost does not shrink with
+    // the length, so a frame of many short copies spends its whole budget in
+    // the call (measured 20 MB/s here). A plain `copy_nonoverlapping` runs at
+    // tens of GB/s once both ranges are known to be committed and protected
+    // for it, which is checked page by page first.
+    let src_ask = std::time::Instant::now();
+    let readable = readable_in_place(src as usize, len);
+    probe(probe::SRC_US, src_ask.elapsed().as_micros() as u64);
+    if readable {
+        let dst_ask = std::time::Instant::now();
+        let writable = writable(dst as usize, len);
+        probe(probe::DST_US, dst_ask.elapsed().as_micros() as u64);
+        if writable {
+            let moved = std::time::Instant::now();
+            // SAFETY: the whole source range is committed and readable and
+            // the whole destination range is committed and writable.
+            unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
+            probe(probe::IN_PLACE_US, moved.elapsed().as_micros() as u64);
+            probe(probe::IN_PLACE, 1);
+            probe(probe::IN_PLACE_BYTES, len as u64);
+            return true;
+        }
+    } else {
+        probe(probe::SRC_NO, 1);
+    }
+    // Something in the range is not: let the kernel say how much it copied,
+    // and take the page-by-page path when it comes up short.
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;
-    // SAFETY: the destination is mapped writable memory of `len` bytes; the
-    // kernel checks the source.
-    unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
+    let asked = std::time::Instant::now();
+    // SAFETY: the destination is `len` bytes the caller may write, host
+    // memory or title memory; the kernel checks both ranges, and a page it
+    // cannot read or write fails the call instead of faulting.
+    let ok = unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 };
+    probe(probe::WHOLE_US, asked.elapsed().as_micros() as u64);
+    probe(probe::WHOLE_CALLS, 1);
+    if !ok {
+        probe(probe::WHOLE_FAILS, 1);
+    }
+    ok
+}
+
+/// Whether the single byte at `at` can be read: the question a page-by-page
+/// presence check puts about a page the working set does not answer for, and
+/// which may still be readable (a page of a file's view reads as not in the
+/// set, measured). One byte through the kernel says, and costs about 0.3 µs:
+/// `ReadProcessMemory` reports a page that is not there instead of faulting.
+pub(crate) fn readable_byte(at: *const u8) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut byte = 0u8;
+    let mut done = 0;
+    // SAFETY: one byte written into a local; the kernel checks the source.
+    unsafe {
+        ReadProcessMemory(GetCurrentProcess(), at.cast(), std::ptr::addr_of_mut!(byte).cast(), 1, &mut done) != 0
+    }
+}
+
+/// Whether the whole of `[at, at + len)` may be copied in user space, asked
+/// page by page of the working set where that is cheaper than the one
+/// `VirtualQuery` it stands for: up to 256 pages an asking, no walk of the
+/// page tables (`crate::texture::readable`), some 30 ns a page.
+///
+/// `VirtualQuery` answers with the length of the run of pages in the same
+/// state, which it finds by walking the page tables to the run's end: about
+/// 2 ms for one question in the title's big pools (see [`copy_mapped`]).
+/// A texture's refresh asks this of its own memory, and 7,870 textures were
+/// due in a frame that spent 16.3 s in texture refreshes with 0.0 ms of it
+/// waiting for title memory to hold still (the copy's asking, one per
+/// texture, is what was left). Pages cost less than that question up to
+/// 16 MiB, which holds every texture but the largest; above it, and for the
+/// host's own memory (which lies far above the console's addresses, in
+/// regions nothing like as long), `VirtualQuery` is asked as before.
+///
+/// `VICTORY_READ_PAGES=1` asks page by page; off by default, and the run
+/// that tried it says why: the pages are cheap only while the memory is
+/// resident. A page the working set does not have is asked with a one-byte
+/// read, and that read faults it in — 320 µs a page in the world's loading on
+/// a host with 17 GB of swap in use, against `VirtualQuery`'s 0.7-3.6 µs on a
+/// texture's 62 KB, which never touches the memory it asks about. Measured
+/// there: 69 asks, 531 ms, for a copy of 6.7 MB. `VirtualQuery` does walk (2
+/// ms, 8.8 ms in the biggest pools, and 827 µs a copy in that same run, its
+/// page tables paged out too), so neither ask is cheap on such a host: what
+/// is cheap is not asking, which needs the layer's own record of what the
+/// title has committed ([`crate::inplace`], `victory-hle`'s `xmem`).
+fn readable_in_place(at: usize, len: usize) -> bool {
+    /// Pages to ask about before one `VirtualQuery` is the cheaper question:
+    /// above this the walk is 4,096 pages a question, and a long range of
+    /// title memory is one region (`readable`).
+    const PAGES_AT_MOST: usize = 16 << 20;
+    if len > PAGES_AT_MOST || !pages_ask() {
+        return readable(at, len);
+    }
+    if len == 0 {
+        return true;
+    }
+    let asked = std::time::Instant::now();
+    let (there, of) = crate::texture::readable(at, len, true);
+    probe(probe::SRC_PAGES_US, asked.elapsed().as_micros() as u64);
+    probe(probe::SRC_PAGES_CALLS, 1);
+    there == of
+}
+
+/// Whether a copy's source is asked page by page of the working set
+/// ([`crate::texture::page_runs`]) rather than by `VirtualQuery` per region.
+///
+/// **Off by default**, and it stays off until the numbers say otherwise: the
+/// run that measured both (gameplay, this fork) found the page ask the worse
+/// of the two on a host whose title does not fit in memory. A page the
+/// working set does not have is asked with a one-byte read, and that read
+/// *faults the page in*: 320 µs a page during loading on a box with 17 GB of
+/// swap in use, so a copy of 6.7 MB spent 531 ms in the asking alone, where
+/// `VirtualQuery` never touches the memory it asks about. The page ask wins
+/// only when the title is resident (23 ns a page, against `VirtualQuery`'s
+/// walk to the end of the region, 0.6-2 ms in the big pools).
+///
+/// `VICTORY_READ_PAGES=1` turns it on: the source asked by
+/// [`crate::texture::page_runs`], and a host destination copied in one pass
+/// by [`read_holes`] (no whole read through the kernel first, no second walk
+/// of the regions for what it could not read). Both were measured working
+/// and byte-identical (the tests below, and 1,800+ pipelines of a world
+/// frame); what is missing is a host with the memory to make them pay.
+fn pages_ask() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_READ_PAGES"))
+}
+
+#[cfg(test)]
+mod page_ask_tests {
+    /// The page-by-page ask answers as the `VirtualQuery` it stands for
+    /// does, on every kind of page a title's memory puts in a range: a
+    /// range all of whose pages are there may be copied in place, one with
+    /// any page that is not may not (and is read through the kernel).
+    #[test]
+    fn the_page_ask_agrees_with_the_query_it_stands_for() {
+        use windows_sys::Win32::System::Memory::*;
+        const PAGE: usize = 4096;
+        const N: usize = 8 * PAGE;
+        // SAFETY: a region of our own, committed a page at a time; every
+        // page touched is one of its own committed pages, and the ones that
+        // are not readable are asked about, never written to.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), N, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE).cast::<u8>();
+            assert!(!base.is_null());
+            for i in (0..N).step_by(PAGE) {
+                base.add(i).write(1);
+            }
+            let ask = |what: &str, at: usize, len: usize| {
+                let (there, of) = crate::texture::readable(at, len, true);
+                assert_eq!(there == of, super::readable(at, len), "{what}");
+            };
+            ask("all committed", base as usize, N);
+            ask("one page", base.add(3 * PAGE) as usize, PAGE);
+            assert!(VirtualFree(base.add(4 * PAGE).cast(), PAGE, MEM_DECOMMIT) != 0);
+            ask("a page decommitted in the middle", base as usize, N);
+            ask("the page before it", base.add(3 * PAGE) as usize, PAGE);
+            ask("the pages after it", base.add(5 * PAGE) as usize, 3 * PAGE);
+            let mut old = 0;
+            assert!(VirtualProtect(base.add(5 * PAGE).cast(), PAGE, PAGE_NOACCESS, &mut old) != 0);
+            ask("a page no one may read", base as usize, N);
+            assert!(VirtualProtect(base.add(5 * PAGE).cast(), PAGE, PAGE_READWRITE, &mut old) != 0);
+            // A guard page is asked about once: the one-byte read the page
+            // ask takes of it clears the guard, as the read the copy makes
+            // of a range it was told is there would. So each ask gets a
+            // guard of its own, set afresh.
+            let guard = base.add(6 * PAGE);
+            assert!(VirtualProtect(guard.cast(), PAGE, PAGE_READWRITE | PAGE_GUARD, &mut old) != 0);
+            assert!(!super::readable(guard as usize, PAGE), "a guard page by the query");
+            assert!(VirtualProtect(guard.cast(), PAGE, PAGE_READWRITE | PAGE_GUARD, &mut old) != 0);
+            let (there, of) = crate::texture::readable(guard as usize, PAGE, true);
+            assert!(there < of, "a guard page by the pages");
+        }
+    }
+
+    /// The one-pass copy of a host destination ([`super::read_holes`]): the
+    /// pages that are there come over byte for byte, the ones that are not
+    /// are zeros, and the walk ends — the bytes the `VirtualQuery` walk it
+    /// stands for gave (`read_sparse`: zeros for a page that is not
+    /// committed), asked page by page.
+    #[test]
+    fn the_one_pass_copy_fills_holes_and_ends() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree,
+        };
+        const PAGE: usize = 4096;
+        const K64: usize = 64 << 10;
+        const LEN: usize = 8 << 20;
+        // SAFETY: an allocation of the test's own, freed at the end; the
+        // holes decommitted are inside it, and nothing reads them.
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                LEN,
+                // The title's pools are write-watched (`victory-hle`'s xmem).
+                MEM_RESERVE | MEM_COMMIT | 0x0020_0000,
+                PAGE_READWRITE,
+            )
+        }
+        .cast::<u8>();
+        assert!(!base.is_null());
+        // SAFETY: `LEN` bytes of its own.
+        unsafe { base.write_bytes(0xab, LEN) };
+        // Two holes: one at the start of a 64 KiB block, one inside one.
+        for at in [2 << 20, (5 << 20) + 3 * PAGE] {
+            // SAFETY: inside the allocation.
+            assert!(unsafe { VirtualFree(base.add(at).cast(), K64, MEM_DECOMMIT) } != 0);
+        }
+        let mut dst = vec![0u8; LEN];
+        super::read_holes(base as *const u8, dst.as_mut_ptr(), LEN);
+        // What is there is copied; what is not is zeros.
+        let mut checked = 0;
+        for (i, byte) in dst.iter().enumerate() {
+            let hole = (i >= 2 << 20 && i < (2 << 20) + K64) || (i >= (5 << 20) + 3 * PAGE && i < (5 << 20) + 3 * PAGE + K64);
+            if hole {
+                assert_eq!(*byte, 0, "byte {i:#x} is in a hole");
+            } else {
+                assert_eq!(*byte, 0xab, "byte {i:#x} is there");
+                checked += 1;
+            }
+        }
+        assert!(checked > LEN * 9 / 10, "{checked} of {LEN} bytes checked");
+        // A range that starts and ends inside pages: the same bytes, cut to
+        // the range (the hole is still a hole, the rest is still copied).
+        let (from, to) = ((2 << 20) - 100, (2 << 20) + K64 + 100);
+        let mut cut = vec![0u8; to - from];
+        // SAFETY: `from` lies inside the allocation.
+        super::read_holes(unsafe { base.add(from) } as *const u8, cut.as_mut_ptr(), to - from);
+        assert!(cut[..100].iter().all(|&b| b == 0xab));
+        assert!(cut[100..100 + K64].iter().all(|&b| b == 0));
+        assert!(cut[100 + K64..].iter().all(|&b| b == 0xab));
+        // SAFETY: the allocation above, released whole.
+        assert!(unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) } != 0);
+    }
+
+    /// One byte read through the kernel says whether a page is readable:
+    /// the question the page-by-page ask puts where the working set has no
+    /// answer.
+    #[test]
+    fn a_byte_tells_whether_a_page_is_readable() {
+        use windows_sys::Win32::System::Memory::*;
+        const PAGE: usize = 4096;
+        // SAFETY: as above.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE).cast::<u8>();
+            assert!(!base.is_null());
+            base.write(1);
+            assert!(super::readable_byte(base));
+            let mut old = 0;
+            assert!(VirtualProtect(base.add(PAGE).cast(), PAGE, PAGE_NOACCESS, &mut old) != 0);
+            assert!(!super::readable_byte(base.add(PAGE)));
+            assert!(VirtualFree(base.add(PAGE).cast(), PAGE, MEM_DECOMMIT) != 0);
+            assert!(!super::readable_byte(base.add(PAGE)));
+        }
+    }
+}
+
+/// Whether the whole of `[at, at + len)` is committed and writable by us.
+///
+/// The destination is checked as well as the source because a plain copy
+/// faults on a bad destination where `ReadProcessMemory` only reports a
+/// short copy: a buffer whose host copy is not there any more (the title
+/// released it, the placement went away) reached this path as a zero
+/// pointer, and the kernel used to absorb that.
+fn writable(at: usize, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY,
+        PAGE_READWRITE, PAGE_WRITECOPY, VirtualQuery,
+    };
+    const WRITABLE: [u32; 4] = [
+        PAGE_READWRITE,
+        PAGE_WRITECOPY,
+        PAGE_EXECUTE_READWRITE,
+        PAGE_EXECUTE_WRITECOPY,
+    ];
+    let end = at.saturating_add(len);
+    let mut p = at;
+    while p < end {
+        probe(probe::DST_REGIONS, 1);
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer for the size given.
+        let n = unsafe { VirtualQuery(p as *const _, &mut info, std::mem::size_of_val(&info)) };
+        // Guard pages fault even when the state says committed.
+        const PAGE_GUARD: u32 = 0x100;
+        if n == 0
+            || info.State != MEM_COMMIT
+            || info.Protect & PAGE_GUARD != 0
+            || !WRITABLE.contains(&(info.Protect & 0xff))
+        {
+            return false;
+        }
+        let next = info.BaseAddress as usize + info.RegionSize;
+        if next <= p {
+            return false;
+        }
+        p = next;
+    }
+    true
+}
+
+/// The end of the run of pages of `[at, at + len)` that the working set says
+/// are ours to write, or `None` if its first page is not one of them.
+///
+/// `K32QueryWorkingSetEx` reports a page's protection as well as whether it
+/// is there (`Win32Protection`: the page's `PAGE_*` value), 256 pages a
+/// question, some 23 ns a page. Only a page the set has is believed: one it
+/// does not may still be committed and writable (trimmed, or never touched),
+/// and the question is then `VirtualQuery`'s. A page whose protection is not
+/// one this knows is asked about too, so a wrong guess here can only make the
+/// copy ask more, never write somewhere it should not.
+/// Whether the whole of `[at, at + len)` is committed and readable by us,
+/// page protections included — the precondition for copying it in user space.
+fn readable(at: usize, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+        PAGE_EXECUTE_WRITECOPY, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY, VirtualQuery,
+    };
+    const READABLE: [u32; 5] = [
+        PAGE_READONLY,
+        PAGE_READWRITE,
+        PAGE_WRITECOPY,
+        PAGE_EXECUTE_READ,
+        PAGE_EXECUTE_READWRITE,
+    ];
+    let end = at.saturating_add(len);
+    let mut p = at;
+    while p < end {
+        probe(probe::SRC_REGIONS, 1);
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(p as *const _, &mut info, std::mem::size_of_val(&info)) };
+        if n == 0 {
+            return false;
+        }
+        // Guard pages fault even when the state says committed.
+        const PAGE_GUARD: u32 = 0x100;
+        if info.State != MEM_COMMIT
+            || info.Protect & PAGE_GUARD != 0
+            || !READABLE.contains(&(info.Protect & 0xff))
+                && info.Protect & 0xff != PAGE_EXECUTE_WRITECOPY
+        {
+            return false;
+        }
+        let next = info.BaseAddress as usize + info.RegionSize;
+        if next <= p {
+            return false;
+        }
+        p = next;
+    }
+    true
 }
 
 #[link(name = "ntdll", kind = "raw-dylib")]
@@ -5711,6 +7001,34 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
 
 const BUFFERS: u32 = 2;
 
+#[derive(Default)]
+struct Presentation {
+    presenter: Option<Presenter>,
+    retry: SwapChainRetry,
+}
+
+#[derive(Default)]
+struct SwapChainRetry {
+    next_attempt: Option<Instant>,
+}
+
+impl SwapChainRetry {
+    /// A desktop can become presentable again. Keep retrying while limiting
+    /// the DXGI calls and warnings during the outage.
+    fn attempt<T, E>(
+        &mut self,
+        now: Instant,
+        operation: impl FnOnce() -> Result<T, E>,
+    ) -> Option<Result<T, E>> {
+        if self.next_attempt.is_some_and(|next| now < next) {
+            return None;
+        }
+        let result = operation();
+        self.next_attempt = result.is_err().then(|| now + Duration::from_secs(1));
+        Some(result)
+    }
+}
+
 struct Presenter {
     swap_chain: IDXGISwapChain3,
     width: u32,
@@ -5805,13 +7123,66 @@ impl Meter {
             }
         }
         {
-            let [own, asking, still, all] =
-                [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+            let [own, asking, still, all, mapped, reading, hashing, detiling] = [0, 1, 2, 3, 4, 5, 6, 7]
+                .map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+            let [count, longest, over] =
+                [0, 1, 2].map(|i| crate::texture::REFRESH_STATS[i].swap(0, Ordering::Relaxed));
             if all >= 1.0 {
                 tracing::info!(
-                    "texture refreshes per frame, all threads: {all:.1} ms, of them {own:.1} ms waiting for a texture another thread \
-                     is refreshing, {asking:.1} ms asking the write watch and the guards, {still:.1} ms waiting for title memory to \
-                     hold still (the runtime remapping it); the rest is reading, hashing and detiling"
+                    "texture refreshes per frame, all threads: {all:.1} ms in {:.0} refreshes (the longest {:.1} ms, {:.0} of \
+                     them a millisecond or more), of them {own:.1} ms waiting for a texture another thread is refreshing, \
+                     {asking:.1} ms asking the write watch and the guards, {still:.1} ms waiting for title memory to hold still \
+                     (the runtime remapping it), {mapped:.1} ms asking what of the texture is mapped, {reading:.1} ms reading it \
+                     through the kernel (reading around unmapped pages included), {hashing:.1} ms hashing it, {detiling:.1} ms \
+                     detiling it",
+                    count as f64 / frames,
+                    longest as f64 / 1000.0,
+                    over as f64 / frames,
+                );
+            }
+            let (held, kernel) = crate::watch::take_journal();
+            let (wait, holding, longest, times) =
+                held.iter().fold((0u64, 0u64, 0u64, 0u64), |a, h| {
+                    (a.0 + h[0], a.1 + h[1], a.2.max(h[2]), a.3 + h[3])
+                });
+            if holding + wait >= 1000 {
+                let by_place: Vec<String> = (0..crate::watch::JOURNAL_SITES.len())
+                    .filter(|&i| held[i][1] > 0)
+                    .map(|i| {
+                        format!(
+                            "{}: {:.1} ms held in {:.0} (the longest {:.1} ms), {:.1} ms waiting for it",
+                            crate::watch::JOURNAL_SITES[i],
+                            held[i][1] as f64 / 1000.0 / frames,
+                            held[i][3] as f64 / frames,
+                            held[i][2] as f64 / 1000.0,
+                            held[i][0] as f64 / 1000.0 / frames
+                        )
+                    })
+                    .collect();
+                let scan = crate::watch::take_journal_scan();
+                let size = crate::watch::take_journal_size();
+                tracing::info!(
+                    "the write-watch journal's map: {} entries with room for {} ({:.1} MB of keys and                      askings), {} runs asked ahead; {} askings since the last line",
+                    size[0],
+                    size[1],
+                    (size[1] * 24) as f64 / (1 << 20) as f64,
+                    size[2],
+                    size[3]
+                );
+                tracing::info!(
+                    "the write-watch journal per frame: {:.1} ms held in {:.0} takings (the longest {:.1} ms), {:.1} ms waiting \
+                     to take it; of what is held, the kernel's answering {:.1} ms in {:.0} calls (the longest {:.1} ms) and the \
+                     journal's own lookups {:.1} ms in {:.0} calls (the rest is the notes written into it); by place: {}",
+                    holding as f64 / 1000.0 / frames,
+                    times as f64 / frames,
+                    longest as f64 / 1000.0,
+                    wait as f64 / 1000.0 / frames,
+                    kernel[1] as f64 / 1000.0 / frames,
+                    kernel[0] as f64 / frames,
+                    kernel[2] as f64 / 1000.0,
+                    scan[1] as f64 / 1000.0 / frames,
+                    scan[0] as f64 / frames,
+                    by_place.join("; ")
                 );
             }
             let [through, left] = [0, 1].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
@@ -5930,6 +7301,20 @@ impl Meter {
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
             );
+            log_probes(frames);
+            if report_copies() {
+                let mut ledger = COPY_WHERE.lock().unwrap_or_else(|e| e.into_inner());
+                let mut entries: Vec<(u64, u64, u64, u64)> = std::mem::take(&mut *ledger);
+                entries.sort_unstable_by_key(|e| std::cmp::Reverse(e.2));
+                for (start, len, us, bytes) in entries.iter().take(8) {
+                    tracing::info!(
+                        buffer = format_args!("{start:#x}+{len:#x}"),
+                        ms_per_frame = *us as f64 / 1000.0 / frames,
+                        mb_per_frame = *bytes as f64 / 1e6 / frames,
+                        "copies: the buffers they went into, biggest first"
+                    );
+                }
+            }
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
@@ -5990,25 +7375,35 @@ impl Host {
             return None;
         };
         let (width, height) = (desc.Width as u32, desc.Height);
-        let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
+        let mut presentation = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
+        let Presentation { presenter, retry } = &mut *presentation;
         if presenter.is_none() {
-            *presenter = match self.presenter(width, height, format) {
+            *presenter = match retry
+                .attempt(Instant::now(), || self.presenter(width, height, format))?
+            {
                 Ok(p) => Some(p),
-                Err(e) => {
-                    tracing::warn!(error = %e, "no swap chain");
+                Err((step, e)) => {
+                    tracing::warn!(error = %e, step, width, height, format = format.0, "no swap chain");
                     return None;
                 }
             };
         }
         let p = presenter.as_mut()?;
         if (p.width, p.height, p.format) != (width, height, format) {
-            // Presents sent ahead hold back buffers until they have run.
-            settle_now(WHY_SYNC);
-            // SAFETY: no back buffer is held; every submission was waited for.
-            let resized = unsafe {
-                p.swap_chain
-                    .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
-            };
+            let resized = retry.attempt(Instant::now(), || {
+                // Presents sent ahead hold back buffers until they have run.
+                settle_now(WHY_SYNC);
+                // SAFETY: no back buffer is held; every submission was waited for.
+                unsafe {
+                    p.swap_chain.ResizeBuffers(
+                        BUFFERS,
+                        width,
+                        height,
+                        format,
+                        DXGI_SWAP_CHAIN_FLAG(0),
+                    )
+                }
+            })?;
             match resized {
                 Ok(()) => {
                     (p.width, p.height, p.format) = (width, height, format);
@@ -6022,7 +7417,7 @@ impl Host {
                     self.log_video_memory("right after the swap chain's buffers were made again");
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, width, height, "swap chain not resized");
+                    tracing::warn!(error = %e, width, height, format = format.0, "swap chain not resized");
                     return None;
                 }
             }
@@ -6109,15 +7504,16 @@ impl Host {
         width: u32,
         height: u32,
         format: DXGI_FORMAT,
-    ) -> windows::core::Result<Presenter> {
+    ) -> Result<Presenter, (&'static str, windows::core::Error)> {
         let hwnd = match title_window() {
             Some(hwnd) => hwnd,
-            None => window(width, height)?,
+            None => window(width, height).map_err(|e| ("window", e))?,
         };
         self.log_video_memory("right before the swap chain is made");
         // SAFETY: plain object creation for our window.
         unsafe {
-            let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+            let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))
+                .map_err(|e| ("DXGI factory", e))?;
             let desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: width,
                 Height: height,
@@ -6132,9 +7528,10 @@ impl Host {
                 ..Default::default()
             };
             let swap_chain = factory
-                .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
-                .cast::<IDXGISwapChain3>()?;
-            let copy = self.new_list()?;
+                .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)
+                .and_then(|chain| chain.cast::<IDXGISwapChain3>())
+                .map_err(|e| ("swap chain", e))?;
+            let copy = self.new_list().map_err(|e| ("copy list", e))?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
             self.log_video_memory("right after the swap chain is made");

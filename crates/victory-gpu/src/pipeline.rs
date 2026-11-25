@@ -389,6 +389,10 @@ pub(crate) fn bound(this: This) {
 #[cfg(windows)]
 pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     if this.is_null() {
+        // The title drew with no pipeline set: counted apart from one that
+        // is not made yet (`VICTORY_PIPELINE_REPORT`) — the frame line
+        // calls both "dropped without a host pipeline".
+        make::no_pipeline();
         return None;
     }
     make::ready(&pipeline(this).host)

@@ -373,9 +373,17 @@ pub(crate) static HEAP_TEXTURES_WAITING: AtomicU64 = AtomicU64::new(0);
 /// (`crate::resource::room`), for the memory line.
 pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 
-/// Frames after a whole upload of a texture picked by index at which its
-/// memory is looked at again, each counted from the look before.
-const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
+/// Milliseconds after a whole upload of a texture picked by index at which
+/// its memory is looked at again, each counted from the look before.
+///
+/// By the clock, not by frames: the title fills a texture's memory after
+/// writing its view, and the look that finds the fill is what brings the
+/// colour in. In frames this was `[4, 12, 40, 120, 400]`, which is 0.07 s
+/// to 6.7 s while frames are 16 ms and 40 s to an hour in the first world
+/// frames: the same 400 frames that keep a slot from ever being looked at
+/// again also keep the fill from ever being seen. These are the 60 Hz
+/// numbers as milliseconds, which is what the title's streaming runs on.
+const RECHECK_MS: [u64; 5] = [66, 200, 667, 2000, 6667];
 
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, and that found it changed (uploaded again), since the start.
@@ -1057,6 +1065,24 @@ impl State {
                         }
                         continue;
                     }
+                    if srv && slot == victory_shader::emit::SLOT_VIEW_ADDRESSES {
+                        // Ours: the title GPU addresses of buffer views in the
+                        // bound view heap, for shaders that read descriptors as
+                        // pointers from the heap.
+                        match self.heap_addresses(list) {
+                            // SAFETY: an open list; the table lives as long
+                            // as the heap the list holds.
+                            Some(gpu) => unsafe {
+                                if compute {
+                                    l.SetComputeRootShaderResourceView(param, gpu);
+                                } else {
+                                    l.SetGraphicsRootShaderResourceView(param, gpu);
+                                }
+                            },
+                            None => once!("a shader reads view addresses from a view heap that is not set"),
+                        }
+                        continue;
+                    }
                     let tabled = srv && crate::pipeline::host::bounded_root_srvs();
                     let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
@@ -1333,6 +1359,27 @@ impl State {
             }
         }
         true
+    }
+
+    /// The GPU address of the bound view heap's buffer-address table
+    /// (`victory_shader::emit::SLOT_VIEW_ADDRESSES`), keeping its buffer alive
+    /// for `list`.
+    fn heap_addresses(&self, list: &HostList) -> Option<u64> {
+        let heap = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())?;
+        let host = heap.host()?;
+        let gpu = host.addresses_gpu()?;
+        const ONCE: usize = usize::MAX - 0x5f;
+        if list.first_use(ONCE)
+            && let Some(buffer) = host.addresses_buffer()
+        {
+            list.keep(buffer);
+        }
+        Some(gpu)
     }
 
     /// For a shader that picks buffers from the view heap by an index it
@@ -1690,7 +1737,7 @@ impl State {
         // Slots whose texture's memory the runtime mapped, unmapped or
         // wrote since the last pass are due again.
         host.texture_slots_remapped(frame);
-        let (due, census) = host.texture_slots_due(frame, 4096);
+        let (due, census) = host.texture_slots_due(frame, std::time::Instant::now(), 4096);
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
             count.store(now, Ordering::Relaxed);
@@ -1699,16 +1746,22 @@ impl State {
         // (`VICTORY_CARD_ACCOUNTING=1`; a line when the card first has no
         // room, and every five seconds after it).
         Self::card_accounting(heap, host, frame, room);
-        // The frames in about four seconds, between 16 and 256: how long a
-        // slot with nothing to upload waits at most for its next look. In
-        // frames alone it was 120: four minutes at the opening cutscene's
-        // half a frame per second, while the title streams by the clock.
-        // (About a second before the runtime told of the memory it maps:
-        // the looks are now only for what that does not tell.)
+        // How long a slot with nothing to upload waits at most for its next
+        // look, in milliseconds: eight frames' worth, at least 16 and at
+        // most four seconds.
+        //
+        // By the clock, because that is the rate the title streams at and
+        // the rate the queue is judged by. In frames alone it was 120, then
+        // (4000 / the last frame's ms) clamped to 16..256, which is right
+        // while frames are short and wrong exactly where the queue matters:
+        // 16 frames of the opening cutscene's half a frame per second is 32
+        // seconds, and a slot whose memory the title never fills holds one
+        // of the 4096 places a frame hands out all the while. A slow frame
+        // now gets a short wait instead of a long one.
         static PASSED: AtomicU64 = AtomicU64::new(0);
         let now = crate::host::now_ms();
         let took = now.saturating_sub(PASSED.swap(now, Ordering::Relaxed)).max(1);
-        let most = (4000 / took).clamp(16, 256);
+        let most = took.saturating_mul(8).clamp(16, 4000);
         // What a table entry of a texture a shader samples says.
         let sampled = UsedResource {
             kind: ResourceType::Srv,
@@ -1770,9 +1823,9 @@ impl State {
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
                 if crate::texture::fingerprint(at, len) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
-                    match RECHECK_FRAMES.get(usize::from(looks) + 1) {
+                    match RECHECK_MS.get(usize::from(looks) + 1) {
                         Some(wait) => {
-                            host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
+                            host.texture_slot_recheck(index, write, *wait, (at, len), print, looks + 1, uploaded)
                         }
                         None => host.texture_slot_done(index, write, None),
                     }
@@ -1800,13 +1853,13 @@ impl State {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                     // Streamed out: what the slot showed is let go.
                     host.texture_slot_gone(index);
-                    host.texture_slot_later(index, write, frame, most);
+                    host.texture_slot_later(index, write, most);
                     continue;
                 }
                 if mapped < len {
                     if mapped <= host.texture_slot_mapped(index) {
                         HEAP_TEXTURES_PARTLY[0].fetch_add(1, Ordering::Relaxed);
-                        host.texture_slot_later(index, write, frame, most);
+                        host.texture_slot_later(index, write, most);
                         continue;
                     }
                     if !crate::texture::committed(address as *const u8, 1) {
@@ -1898,7 +1951,10 @@ impl State {
             // title mapped: again in 120 frames, as before).
             let again = match partly {
                 Some(mapped) => Some((frame + 1, mapped)),
-                None => (!whole).then_some((frame + 120, 0)),
+                // Not all of it there: next frame, by the clock the title
+                // streams at (it was 120 frames, two minutes in a world
+                // frame of a second).
+                None => (!whole).then_some((frame + 1, 0)),
             };
             if again.is_some() {
                 HEAP_TEXTURES_PARTLY[1].fetch_add(1, Ordering::Relaxed);
@@ -1930,7 +1986,7 @@ impl State {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
                     let print = crate::texture::fingerprint(at, len);
-                    host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[0], (at, len), print, 0, frame);
+                    host.texture_slot_recheck(index, write, RECHECK_MS[0], (at, len), print, 0, frame);
                 }
                 None => host.texture_slot_done(index, write, again),
             }
@@ -2336,7 +2392,7 @@ impl State {
             let draws: u32 = census.1.values().sum();
             if draws > 0 {
                 let mut rects: Vec<([i32; 4], u32)> = census.1.iter().map(|(r, n)| (*r, *n)).collect();
-                rects.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+                rects.sort_unstable_by_key(|r| std::cmp::Reverse(r.1));
                 let scissors: Vec<String> = rects
                     .iter()
                     .take(5)

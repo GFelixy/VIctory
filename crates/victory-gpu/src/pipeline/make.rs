@@ -118,6 +118,10 @@ pub(crate) fn waiting() -> u64 {
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+    // Every draw and dispatch comes through here: this is what tells one
+    // title frame from the next for the report (a frame with nothing being
+    // made has no wait at all, and still gets its line).
+    report_frame(crate::frame::current());
     // A still-pending pipeline was requested by the title too. Prewarm it
     // on the next launch, even if this run never got to use it.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
@@ -127,7 +131,128 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         start(p, REQUESTED);
         wait(p, crate::frame::current());
     }
-    p.made.get()?.as_ref()
+    match p.made.get() {
+        Some(Some(made)) => Some(made),
+        // The draw or dispatch goes without. Counted per pipeline for
+        // `VICTORY_PIPELINE_REPORT`: this does not tell a pipeline still
+        // being made from one refused (`missing` does).
+        _ => {
+            note_drop(&p.key);
+            None
+        }
+    }
+}
+
+/// A draw or dispatch with no pipeline set (the title's own record of it
+/// is null: it never bound one, or the pipeline it wanted was never made
+/// for it by a method we do not implement). Counted apart from a pipeline
+/// that exists and is not made: the two have different fixes.
+pub(crate) fn no_pipeline() {
+    counted(|r| r.no_pipeline += 1, crate::frame::current());
+}
+
+/// `VICTORY_PIPELINE_REPORT=1`: what one frame's waits and drops were, by
+/// pipeline, without a diagnostics build: how many of the dropped draws
+/// wanted the same pipeline, and how much of the frame went to waiting. A
+/// frame's line is written at the first wait of the next frame.
+fn reporting() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_REPORT").is_some_and(|v| v != "0"))
+}
+
+/// One frame's waits and the draws and dispatches that went without, by
+/// the key of the pipeline they wanted.
+#[derive(Default)]
+struct Report {
+    frame: u64,
+    waits: u64,
+    waited: Duration,
+    out_of_budget: u64,
+    not_ready: u64,
+    /// Draws and dispatches with no pipeline set at all.
+    no_pipeline: u64,
+    /// Draws and dispatches that went without, by pipeline key.
+    drops: Vec<(String, u64)>,
+}
+
+static REPORT: Mutex<Report> = Mutex::new(Report {
+    frame: 0,
+    waits: 0,
+    waited: Duration::ZERO,
+    out_of_budget: 0,
+    not_ready: 0,
+    no_pipeline: 0,
+    drops: Vec::new(),
+});
+
+/// The frame the report is about; a draw of a new frame reads it without
+/// taking the lock.
+static REPORTED: AtomicU64 = AtomicU64::new(0);
+
+/// A draw or dispatch went without a host pipeline for the pipeline `key`.
+fn note_drop(key: &str) {
+    if !reporting() {
+        return;
+    }
+    let mut report = REPORT.lock().unwrap_or_else(|e| e.into_inner());
+    // Few pipelines per frame (a key is what the pipeline is made from).
+    match report.drops.iter_mut().find(|(k, _)| k == key) {
+        Some((_, draws)) => *draws += 1,
+        None => report.drops.push((key.to_owned(), 1)),
+    }
+}
+
+/// Adds to frame `frame`'s report; a wait of the next frame has started a
+/// new one ([`report_frame`]), and the late count would be its own.
+fn counted(what: impl FnOnce(&mut Report), frame: u64) {
+    if !reporting() {
+        return;
+    }
+    let mut report = REPORT.lock().unwrap_or_else(|e| e.into_inner());
+    if report.frame == frame {
+        what(&mut report);
+    }
+}
+
+/// Logs the frame before this one, when a new frame's first wait comes.
+fn report_frame(frame: u64) {
+    if !reporting() || REPORTED.swap(frame, Ordering::Relaxed) == frame {
+        return;
+    }
+    let mut report = REPORT.lock().unwrap_or_else(|e| e.into_inner());
+    if report.frame == frame {
+        return;
+    }
+    if report.frame != 0 {
+        let dropped: u64 = report.drops.iter().map(|(_, n)| *n).sum();
+        let queued = waiting();
+        let mut top: Vec<&(String, u64)> = report.drops.iter().collect();
+        top.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        tracing::info!(
+            frame = report.frame,
+            waits = report.waits,
+            waited_ms = report.waited.as_secs_f64() * 1e3,
+            out_of_budget = report.out_of_budget,
+            not_ready = report.not_ready,
+            no_pipeline = report.no_pipeline,
+            dropped,
+            pipelines = report.drops.len(),
+            queued_now = queued,
+            "the frame before this one: pipeline waits, and the draws that went without \
+             (no_pipeline: no pipeline set at all; dropped: a pipeline that was not made)"
+        );
+        for (key, draws) in top.iter().take(8) {
+            tracing::info!(
+                pipeline_key = %key,
+                draws = *draws,
+                "one pipeline's share of the draws that went without"
+            );
+        }
+    }
+    *report = Report {
+        frame,
+        ..Default::default()
+    };
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
@@ -161,6 +286,7 @@ fn shared_budget() -> bool {
 
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
+    report_frame(frame);
     let budget = wait_budget();
     if budget.is_zero() {
         return;
@@ -181,6 +307,7 @@ fn wait(p: &Pending, frame: u64) {
         left
     };
     if left.is_zero() {
+        counted(|r| r.out_of_budget += 1, frame);
         return;
     }
     let started = Instant::now();
@@ -210,6 +337,17 @@ fn wait(p: &Pending, frame: u64) {
     crate::copystat::add(
         crate::copystat::C::PipelineWaitUs,
         started.elapsed().as_micros() as u64,
+    );
+    let ran = started.elapsed();
+    counted(
+        |r| {
+            r.waits += 1;
+            r.waited += ran;
+            if p.made.get().is_none() {
+                r.not_ready += 1;
+            }
+        },
+        frame,
     );
 }
 
@@ -292,21 +430,78 @@ fn next() -> Arc<Pending> {
     }
 }
 
-/// Starts the workers (half the logical processors, 2 to 8) on first use.
+/// How many workers, and at what priority (`VICTORY_PIPELINE_THREADS`, a
+/// count, default all but one of the logical processors, 2 to 16; and
+/// `VICTORY_PIPELINE_PRIORITY`: `normal` (the default), `below` or
+/// `above`).
+///
+/// They used to run below the title's own threads (half the processors,
+/// below normal). Made on the title's threads, the world's first frame
+/// wanted over 1,200 new pipelines at once (decision 0007), so they are
+/// kept off them; but below normal let the title's recording threads take
+/// the processor from them where a pipeline was wanted now: the same
+/// machine made 646 pipelines in 13 s while the title was loading
+/// (~50/s) and 268 in 43.5 s during the first world frame (~6/s), with
+/// 6609 draws then dropped for want of a pipeline. Equal priority is the
+/// fair share; `below` is what was measured before (runs 100+).
+fn worker_count() -> usize {
+    let logical = std::thread::available_parallelism().map_or(2, |n| n.get());
+    match std::env::var("VICTORY_PIPELINE_THREADS") {
+        Ok(value) if !value.trim().is_empty() => value
+            .trim()
+            .parse::<usize>()
+            .map(|n| n.clamp(2, 16))
+            .unwrap_or_else(|_| {
+                tracing::warn!(value, "VICTORY_PIPELINE_THREADS is not a count");
+                logical.saturating_sub(1).clamp(2, 16)
+            }),
+        _ => logical.saturating_sub(1).clamp(2, 16),
+    }
+}
+
+/// The priority the worker threads ask for.
+fn worker_priority() -> windows::Win32::System::Threading::THREAD_PRIORITY {
+    use windows::Win32::System::Threading::*;
+    static CHOSEN: OnceLock<THREAD_PRIORITY> = OnceLock::new();
+    *CHOSEN.get_or_init(|| match std::env::var("VICTORY_PIPELINE_PRIORITY") {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "below" | "low" => THREAD_PRIORITY_BELOW_NORMAL,
+            "above" | "high" => THREAD_PRIORITY_ABOVE_NORMAL,
+            "normal" | "" => THREAD_PRIORITY_NORMAL,
+            other => {
+                tracing::warn!(
+                    value = other,
+                    "VICTORY_PIPELINE_PRIORITY expects normal, below or above"
+                );
+                THREAD_PRIORITY_NORMAL
+            }
+        },
+        // The title's own threads run at normal: an equal share, not more.
+        Err(_) => THREAD_PRIORITY_NORMAL,
+    })
+}
+
+/// Starts the workers on first use (see [`worker_count`]).
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let workers = worker_count();
+        let priority = worker_priority();
+        tracing::info!(
+            workers,
+            priority = ?priority,
+            logical = std::thread::available_parallelism().map_or(0, |n| n.get()),
+            "host pipeline workers"
+        );
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
-                .spawn(|| {
-                    // Below the title's own threads (loading, recording).
+                .spawn(move || {
                     // SAFETY: a plain call on our own thread.
                     unsafe {
                         use windows::Win32::System::Threading::*;
-                        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                        let _ = SetThreadPriority(GetCurrentThread(), priority);
                     }
                     loop {
                         next().make();
@@ -335,10 +530,28 @@ static PEAK: AtomicU64 = AtomicU64::new(0);
 fn drained() {
     use super::library::{EARLY, LOADED, MADE};
     if PEAK.swap(0, Ordering::Relaxed) >= 10 {
+        // Between lines: the batch's own made count and its seconds, so a
+        // reader does not have to difference the absolute numbers (loaded
+        // from the library and made on this machine are different costs:
+        // a make is a compile, 3.4 s of one for the biggest programs).
+        static LAST: Mutex<Option<(u64, Instant)>> = Mutex::new(None);
+        let made = MADE.load(Ordering::Relaxed);
+        let now = Instant::now();
+        let (before, when) = {
+            let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+            let was = last.unwrap_or((made, now));
+            *last = Some((made, now));
+            was
+        };
+        let batch = made.saturating_sub(before);
+        let seconds = when.elapsed().as_secs_f64().max(1e-3);
         tracing::info!(
-            made = MADE.load(Ordering::Relaxed),
+            made,
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
+            batch,
+            batch_ms = when.elapsed().as_secs_f64() * 1e3,
+            made_per_s = batch as f64 / seconds,
             "host pipelines all made"
         );
     }
