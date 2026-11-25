@@ -1728,7 +1728,22 @@ impl State {
         // makes room again: so the slots are still looked at (the pass
         // returned here, and a slot whose texture had been streamed out
         // kept its host copy for as long as the card was full).
-        let room = crate::resource::room();
+        let mut room = crate::resource::room();
+        if !room {
+            // The card is full: let go of every host copy nothing names right
+            // now (not only those quiet for some frames), which makes room
+            // again for the textures that were waiting. A run's card held
+            // 3,287 MB of copies, 1,791 MB of them levels whose title memory
+            // was not mapped any more. At most every eighth frame: the walk
+            // takes a millisecond over thousands of textures.
+            static SWEPT: AtomicU64 = AtomicU64::new(0);
+            let last = SWEPT.load(Ordering::Relaxed);
+            if frame == u64::MAX || frame.saturating_sub(last) >= 8 || last > frame {
+                SWEPT.store(frame, Ordering::Relaxed);
+                crate::resource::let_go_now();
+                room = crate::resource::room();
+            }
+        }
         if !room {
             HEAP_TEXTURES_FULL.fetch_add(1, Ordering::Relaxed);
             once!("textures picked by index: the card has no room for more; they wait");

@@ -1638,7 +1638,7 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
 /// - only the host copy holds the host texture: no descriptor slot views
 ///   it (a slot keeps what it views, `HostHeap::kept`), so no shader can
 ///   read it through a slot made earlier, by a table or by an index;
-/// - nothing asked for it for `IDLE_MS` and `IDLE_FRAMES` frames.
+/// - nothing asked for it for `IDLE_MS` and `idle_frames` frames.
 ///
 /// The next use makes the host copy anew and uploads the title's memory
 /// again (its staging state goes with it). The title resource stays: its
@@ -1650,9 +1650,8 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
 /// Called before a submission starts, by the thread that submits.
 /// `VICTORY_TEXTURE_SWEEP=0` lets nothing go.
 #[cfg(windows)]
-pub(crate) fn let_go_idle() {
+fn let_go(idle_frames: u64) {
     use std::sync::atomic::Ordering::Relaxed;
-    const IDLE_FRAMES: u64 = 4;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
@@ -1672,7 +1671,7 @@ pub(crate) fn let_go_idle() {
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             let idle = made.as_ref().is_some_and(|(host, _)| {
-                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
+                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, idle_frames)
                     && std::sync::Arc::strong_count(host) == 1
                     && crate::host::references(&host.texture) == 1
             });
@@ -1706,6 +1705,19 @@ pub(crate) fn let_go_idle() {
             )
         });
     }
+}
+
+/// [`let_go`] with the four frames of quiet every submission allows.
+pub(crate) fn let_go_idle() {
+    let_go(4);
+}
+
+/// [`let_go`] with no quiet at all: every host copy nothing names right now
+/// goes, which is what a full card needs for the texture it has to upload
+/// (`draw::HostList::heap_textures`, when [`room`] says there is none). The
+/// lists' and slots' references still keep what a draw of the frame names.
+pub(crate) fn let_go_now() {
+    let_go(0);
 }
 
 /// For the memory line: title textures with a host copy the host renders
