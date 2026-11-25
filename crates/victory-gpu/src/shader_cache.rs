@@ -252,6 +252,44 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     }
 }
 
+/// What [`warm`] found for one container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Warmed {
+    /// The entry was already there (a translation, or a refusal recorded
+    /// earlier).
+    Cached,
+    /// Translated now and written to the cache.
+    Translated,
+}
+
+/// Translates `container` into the cache and nothing else: no host device,
+/// no pipelines. This is what the offline warm-up (`victory precompile`)
+/// asks for, so that a run does not translate while it plays.
+///
+/// The key is the run's: the same executable (or translator, under
+/// `VICTORY_SHADER_CACHE_KEY=translator`), the same GPU limits and the same
+/// switches (`VICTORY_HOST_WAVE`, `VICTORY_VIEW_LIMIT`, `VICTORY_SHADER_*`).
+/// A refusal is recorded too, as a run records it, and comes back as `Err`.
+pub fn warm(container: &[u8]) -> Result<Warmed, String> {
+    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let Some(cache) = CACHE.get() else {
+        return translate(container).map(|_| Warmed::Translated);
+    };
+    let input = [&build()[..], container].concat();
+    let converter = Translate {
+        translate,
+        made: Mutex::new(None),
+    };
+    cache
+        .get_or_convert(&converter, &input)
+        .map_err(|e| format!("{e:#}"))?;
+    match converter.take() {
+        Some(Ok(_)) => Ok(Warmed::Translated),
+        Some(Err(reason)) => Err(reason),
+        None => Ok(Warmed::Cached),
+    }
+}
+
 /// The cache entry's converter: the build and the container in, the
 /// encoded translation (or its refusal) out. `made` keeps what a miss just
 /// translated, so a miss does not read its own entry back (a just-written
