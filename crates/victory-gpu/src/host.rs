@@ -6463,11 +6463,42 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 }
 
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
-/// readable. The common case (both ends this process's own committed,
-/// readable and writable memory) is copied in user space; the kernel is
-/// asked for the rest, because it reports a short copy where a plain copy
-/// would fault.
+/// readable.
+///
+/// The kernel reads first (`NtReadVirtualMemory`): it reports a page it cannot
+/// read instead of faulting, and answers no question about the pages first.
+/// That question — `VirtualQuery` per range — is what made copies run at
+/// 100-200 MB/s: it walks the page tables to the end of the region, 0.86 ms a
+/// call in the title's big pools, and one world frame put 16,472 of them
+/// (14.2 s of its 13.2 s frame, against 28 ms for the copies themselves).
+/// Whatever the kernel cannot read goes the way it always did
+/// ([`read_checked`]), so a copy leaves the bytes it left before.
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut done = 0;
+    let asked = std::time::Instant::now();
+    // SAFETY: the destination is `len` bytes the caller may write, host
+    // memory or title memory; the kernel checks both ranges and reports a
+    // page it cannot read instead of faulting.
+    let status = unsafe { NtReadVirtualMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) };
+    probe(probe::WHOLE_US, asked.elapsed().as_micros() as u64);
+    probe(probe::WHOLE_CALLS, 1);
+    if status >= 0 && done == len {
+        return true;
+    }
+    probe(probe::WHOLE_FAILS, 1);
+    read_checked(src, dst, len)
+}
+
+/// The way every copy ran before the kernel was tried first: ask the pages
+/// (copied in place when both ranges are this process's own committed
+/// memory), else let the kernel copy what it can. Its answers are the
+/// program's own: the kernel's fast path only skips the question where the
+/// kernel could read the whole range anyway.
+fn read_checked(src: *const u8, dst: *mut u8, len: usize) -> bool {
     if len == 0 {
         return true;
     }
@@ -6829,6 +6860,17 @@ fn readable(at: usize, len: usize) -> bool {
 
 #[link(name = "ntdll", kind = "raw-dylib")]
 unsafe extern "system" {
+    /// The kernel's read of a process's memory, `(process, address, bytes,
+    /// length, read out)`: an NTSTATUS, negative when a page of the source is
+    /// not there or not readable. It changes no protection and asks nothing
+    /// about the pages first.
+    fn NtReadVirtualMemory(
+        process: *mut std::ffi::c_void,
+        base: *const std::ffi::c_void,
+        buffer: *mut std::ffi::c_void,
+        size: usize,
+        read: *mut usize,
+    ) -> i32;
     /// The kernel's write into a process's memory, `(process, address,
     /// bytes, length, written out)`: an NTSTATUS, negative when a page of
     /// the range is not there or not writable. It changes no protection.
