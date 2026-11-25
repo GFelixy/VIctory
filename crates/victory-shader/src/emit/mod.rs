@@ -84,6 +84,7 @@ mod bitcode;
 mod container;
 #[cfg(all(test, windows))]
 mod diff_tests;
+pub mod exposure;
 #[cfg(all(test, windows))]
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
@@ -92,6 +93,7 @@ mod lower;
 mod own_bits;
 mod rect;
 mod sampler;
+pub mod stand_in;
 mod shader;
 mod threading;
 #[cfg(windows)]
@@ -290,6 +292,37 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let p = crate::spill::build(&native)?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
+    let st = structure::structure(&p);
+    let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
+    let io = io::raise(&p, &native)?;
+    let st = st?;
+    emit(&c, &native, &p, &st, &io, &res)
+}
+
+/// Translates `container` with `code` in place of its own GFX10 machine code:
+/// what a stand-in needs, keeping the original's bindings (its root layout,
+/// read from the container) and writing its own values ([`exposure`]).
+fn translate_code(container: &[u8], code: Option<Vec<u8>>) -> Result<HostShader, ShaderError> {
+    let c = Container::parse(container)?;
+    let dxil = c
+        .part(FourCC::DXIL)
+        .ok_or(ShaderError::Malformed("no DXIL part"))?;
+    let mut native = crate::native_programs(dxil.data)?
+        .into_iter()
+        .find(|p| {
+            matches!(
+                p.stage,
+                HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms
+            )
+        })
+        .ok_or(ShaderError::Unsupported {
+            offset: 0,
+            what: "a container without a vertex, pixel, compute or mesh program",
+        })?;
+    if let Some(code) = code {
+        native.code = code;
+    }
+    let p = crate::spill::build(&native)?;
     let st = structure::structure(&p);
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
