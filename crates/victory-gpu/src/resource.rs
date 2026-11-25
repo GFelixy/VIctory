@@ -1171,6 +1171,10 @@ struct Hosted {
 pub(crate) static KINDS: [std::sync::atomic::AtomicU64; 7] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 7];
 
+/// Copies not made because the card's share for them was full
+/// (`copies_room`).
+#[cfg(windows)]
+pub(crate) static COPY_OVER_CAP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Every title texture alive (not buffers), by address: for the sweep and
 /// the memory line. A texture leaves the table before it is freed.
 #[cfg(windows)]
@@ -1290,6 +1294,47 @@ pub(crate) fn host_waits(this: This) -> bool {
         && r.host.made.lock().unwrap_or_else(|e| e.into_inner()).is_none()
 }
 
+/// The share of the card the host copies of textures may take, in bytes
+/// (`VICTORY_TEXTURE_COPIES_MB`, 2,048 MB by default). Every view the title
+/// makes of a texture gets its copy at the full description's footprint
+/// (`hosted`), whether or not a draw ever names it: a loading screen with 17
+/// draws held 13,394 copies of 5,355 MB, 2,695 MB of them levels whose title
+/// memory was never mapped, and the card went over its budget (8.1 GB of a
+/// 6.8 GB budget, 4.2 GB in shared memory). Over the cap no copy is made:
+/// the slot, the draw or the upload that asked tries again once a sweep has
+/// let copies nothing names go (`let_go_now`).
+#[cfg(windows)]
+fn copies_cap() -> u64 {
+    static CAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_COPIES_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(2048, |mb| mb.clamp(256, 8192)) << 20
+    })
+}
+
+/// Whether a host copy of `bytes` may still be made, by what the alive copies
+/// take ([`KINDS`]).
+#[cfg(windows)]
+fn copies_room(bytes: u64) -> bool {
+    KINDS[1].load(std::sync::atomic::Ordering::Relaxed) + bytes <= copies_cap()
+}
+
+/// The share of the card the copies the host GPU wrote may take, in bytes
+/// (`VICTORY_TEXTURE_WRITTEN_MB`, 1,024 MB by default). Their contents are on
+/// the card only: the sweep keeps them even when nothing names them, until
+/// the whole of them passes this.
+#[cfg(windows)]
+fn written_cap() -> u64 {
+    static CAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_WRITTEN_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(1024, |mb| mb.clamp(128, 8192)) << 20
+    })
+}
 /// The host side of title texture `this`: made now if it is not there and
 /// `make` says so. `None` for buffers and for textures the host refuses.
 #[cfg(windows)]
@@ -1309,6 +1354,21 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             .clear
             .as_ref()
             .map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast::<c_void>());
+        // The card's share for host copies of textures is full: no copy is
+        // made now (the asking side tries again after a sweep). Nothing is
+        // remembered as refused: later, with room, it is made.
+        let bytes = footprint(&r.desc).map_or(0, |f| f.size);
+        if !copies_room(bytes) {
+            if COPY_OVER_CAP.fetch_add(1, Relaxed) == 0 {
+                crate::host::trail(|| {
+                    format!(
+                        "host copies of textures reached their share of the card ({} MB, VICTORY_TEXTURE_COPIES_MB): no more are made until those nothing names have gone",
+                        copies_cap() >> 20
+                    )
+                });
+            }
+            return None;
+        }
         let Some(texture) = host_texture(&r.desc, r.host.state, clear) else {
             r.host.refused.store(true, Relaxed);
             return None;
@@ -1661,17 +1721,45 @@ fn let_go(idle_frames: u64) {
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
     let all = textures();
+    // The bytes of the copies the host GPU wrote, against their share of the
+    // card (`written_cap`): over it, the ones nothing names go like any other.
+    let written_over = {
+        let cap = written_cap();
+        let mut total = 0u64;
+        for &at in all.iter() {
+            // SAFETY: as in the loop below.
+            let r = unsafe { &*(at as *const Resource) };
+            if !fills(&r.desc) || !crate::texture::host_wrote(at) {
+                continue;
+            }
+            if let Some((host, _)) = r.host.made.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                total += host.bytes;
+            }
+            if total > cap {
+                break;
+            }
+        }
+        total > cap
+    };
     for &at in all.iter() {
         // SAFETY: a texture leaves the table before it is freed, under the
         // lock held here (`Drop for Resource`).
         let r = unsafe { &*(at as *const Resource) };
-        if !fills(&r.desc) || crate::texture::host_wrote(at) {
+        if !fills(&r.desc) {
             continue;
         }
+        // A copy the host GPU wrote (a render target, an animation's frame)
+        // is kept whatever happens: its contents are on the card, not in
+        // title memory, and letting it go loses them. Kept until the whole
+        // of them passes its share of the card (`written_cap`): the run's
+        // loading animations alone took 2 GB and then 6 GB, one frame per
+        // texture, none ever named again.
+        let written = crate::texture::host_wrote(at);
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             let idle = made.as_ref().is_some_and(|(host, _)| {
-                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, idle_frames)
+                (!written || written_over)
+                    && crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, idle_frames)
                     && std::sync::Arc::strong_count(host) == 1
                     && crate::host::references(&host.texture) == 1
             });
