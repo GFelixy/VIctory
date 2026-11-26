@@ -187,6 +187,11 @@ pub fn run(
     victory_hle::runtime::set_title_dll_loader(Box::new(move |file| {
         late.load(file, show).map_err(|e| format!("{e:#}"))
     }));
+    // The standard-D3D12 upload patch, when asked for: it takes over creation,
+    // upload and barriers for the title's resources, and this runtime forwards
+    // (see `VICTORY_FORWARD_ONLY`).
+    #[cfg(windows)]
+    install_upload_patch(image.base());
     // SAFETY: imports are bound; from here on we run title code.
     let main = unsafe { Arc::new(image).spawn_main(dlls)? };
     let code = main
@@ -194,6 +199,66 @@ pub fn run(
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
     println!("title exited with {code}");
     Ok(code)
+}
+
+/// Loads `scarlett_upload_patch.dll` (overridable with `VICTORY_UPLOAD_PATCH`)
+/// and installs it into the title mapped at `base`, which is not this process's
+/// main module. The patch's backend needs the title's D3D12 device and queues,
+/// which exist only once the title has started, so a thread keeps asking until
+/// it takes. A failure is reported and the run goes on.
+#[cfg(windows)]
+fn install_upload_patch(base: usize) {
+    use std::ffi::c_void;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn LoadLibraryW(name: *const u16) -> *mut c_void;
+        fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+    }
+    use std::os::windows::ffi::OsStrExt;
+
+    type Install = unsafe extern "system" fn(*mut c_void) -> u32;
+
+    let path = match std::env::var_os("VICTORY_UPLOAD_PATCH") {
+        Some(path) => std::path::PathBuf::from(path),
+        // Off unless asked for: it is a separate project, not shipped here.
+        None => return,
+    };
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: plain Win32 calls; the library stays loaded for the process's life.
+    let install: Install = unsafe {
+        let module = LoadLibraryW(wide.as_ptr());
+        if module.is_null() {
+            println!("upload patch: not loaded ({})", path.display());
+            return;
+        }
+        let name = b"ScarlettUploadInstallAt\0";
+        let at = GetProcAddress(module, name.as_ptr());
+        if at.is_null() {
+            println!("upload patch: loaded, but it has no ScarlettUploadInstallAt");
+            return;
+        }
+        std::mem::transmute(at)
+    };
+    // The device and queues come up during the title's own start: ask again
+    // until the patch takes, so its hooks are on before the heavy creation.
+    let _ = std::thread::Builder::new()
+        .name("victory-upload-patch".into())
+        .spawn(move || {
+            for attempt in 0..600u32 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                // SAFETY: the export is called with the title's base.
+                if unsafe { install(base as *mut c_void) } != 0 {
+                    println!("upload patch: installed after {attempt} tries");
+                    return;
+                }
+            }
+            println!("upload patch: the title never had a device to install on");
+        });
 }
 
 #[cfg(windows)]

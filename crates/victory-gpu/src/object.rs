@@ -68,7 +68,12 @@ unsafe impl<const N: usize> Sync for Table<N> {}
 
 pub(crate) extern "system" fn add_ref(this: This) -> u32 {
     // SAFETY: `this` is one of our objects.
-    unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1
+    let left = unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1;
+    // `VICTORY_TRACE_RESOURCES=1`: every reference taken, by object.
+    if std::env::var_os("VICTORY_TRACE_RESOURCES").is_some() {
+        tracing::info!(ptr = format_args!("{this:p}"), left, "add_ref");
+    }
+    left
 }
 
 pub(crate) extern "system" fn release(this: This) -> u32 {
@@ -105,6 +110,14 @@ pub(crate) fn answer(kind: usize, iid: *const Iid, found: Option<This>, out: *mu
 pub(crate) const IUNKNOWN: Iid = guid(0, 0, 0, [0xc0, 0, 0, 0, 0, 0, 0, 0x46]);
 
 /// Whether `iid` is one of `known`, or `IUnknown`.
+/// `VICTORY_ANY_IID=1`: every interface query succeeds. A layer written for
+/// the desktop interfaces asks with desktop ids; the console's are not the
+/// same strings.
+fn any_iid() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ANY_IID").is_some_and(|v| v == "1"))
+}
+
 pub(crate) fn is(iid: *const Iid, known: &[Iid]) -> bool {
     // SAFETY: the title passes an interface id (null is tolerated).
     unsafe { iid.as_ref() }.is_some_and(|i| *i == IUNKNOWN || known.contains(i))
@@ -113,6 +126,32 @@ pub(crate) fn is(iid: *const Iid, known: &[Iid]) -> bool {
 /// Hands a new object to the title as one of `known`, or drops it. `T`
 /// starts with its `Object`; its table's release slot is
 /// [`release_boxed::<T>`].
+/// How many references an object holds.
+pub(crate) fn refs_of(this: This) -> u32 {
+    // SAFETY: `this` is one of our objects.
+    unsafe { &*this }.refs.load(Ordering::Relaxed)
+}
+
+/// The table pointer an object holds, for tracing: a zero here means the
+/// object's memory no longer holds a vtable.
+pub(crate) fn table_of(this: This) -> *const *const () {
+    // SAFETY: `this` is one of our objects.
+    unsafe { *this.cast::<*const *const ()>() }
+}
+
+/// Like [`hand_out`], but the interface id is not checked: for objects a
+/// caller outside the console's runtime asks for by a desktop id.
+pub(crate) fn hand_out_any<T>(
+    kind: usize,
+    object: Box<T>,
+    out: *mut This,
+) -> HRESULT {
+    if out.is_null() {
+        return S_FALSE;
+    }
+    answer(kind, std::ptr::null(), Some(Box::into_raw(object).cast()), out)
+}
+
 pub(crate) fn hand_out<T>(
     kind: usize,
     object: Box<T>,
@@ -215,6 +254,13 @@ extern "system" fn set_private_data(
 /// Fills a D3D12 table's object methods: private data and name (setting
 /// an interface as private data stays unwritten).
 pub(crate) const fn d3d12_object<const N: usize>(mut f: [*const (); N]) -> [*const (); N] {
+    // AddRef: every D3D12 object's slot 1. Without it a caller that takes a
+    // reference (an injected layer keeping a resource until its GPU work
+    // retires) has one that does not count, and the later Release frees the
+    // object while its owner still holds it.
+    if N > 1 {
+        f[1] = add_ref as *const (); // 0x08
+    }
     f[3] = get_private_data as *const (); // 0x18
     f[4] = set_private_data as *const (); // 0x20
     f[6] = set_name as *const (); // 0x30
@@ -239,12 +285,10 @@ pub(crate) extern "system" fn set_name(this: This, name: *const u16) -> HRESULT 
 /// the interfaces the device itself answers to.
 pub(crate) extern "system" fn parent_device(_: This, iid: *const Iid, out: *mut This) -> HRESULT {
     let device = crate::device::device();
-    answer(
-        DEVICE,
-        iid,
-        crate::device::is_device(iid).then_some(device),
-        out,
-    )
+    // `VICTORY_ANY_IID` too: a caller asking with a desktop id still gets the
+    // device, and never a null it does not check.
+    let known = crate::device::is_device(iid) || any_iid();
+    answer(DEVICE, iid, known.then_some(device), out)
 }
 
 pub(crate) const DEVICE: usize = 0;

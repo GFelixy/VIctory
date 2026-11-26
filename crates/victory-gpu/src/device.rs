@@ -273,12 +273,15 @@ extern "system" fn check_feature_support(
     const FEATURE_LEVELS: u32 = 2;
     const FORMAT_SUPPORT: u32 = 3;
     const MULTISAMPLE: u32 = 4;
+    /// `D3D12_FEATURE_DATA_FORMAT_INFO`: the format's plane count.
+    const FORMAT_INFO: u32 = 5;
     let expected = match feature {
         OPTIONS_QUERY => size_of_val(&OPTIONS),
         ARCHITECTURE => 16,
         FEATURE_LEVELS => size_of::<FeatureLevels>(),
         FORMAT_SUPPORT => 12,
         MULTISAMPLE => 16,
+        FORMAT_INFO => 8,
         _ => {
             tracing::warn!(feature, size, "device feature query not implemented");
             return E_NOTIMPL;
@@ -301,6 +304,18 @@ extern "system" fn check_feature_support(
             }
             // Not tile-based; unified, cache-coherent memory.
             a[1..].copy_from_slice(&[0, 1, 1]);
+            S_OK
+        }
+        FORMAT_INFO => {
+            // SAFETY: checked size and non-null.
+            let q = unsafe { &mut *data.cast::<[u32; 2]>() };
+            // R32G8X24 and R24G8 families are depth with a stencil plane; every
+            // other format is one plane. Values are DXGI_FORMAT numbers, which
+            // is what the title passes.
+            q[1] = match q[0] {
+                19..=22 | 44..=47 => 2,
+                _ => 1,
+            };
             S_OK
         }
         FORMAT_SUPPORT => {

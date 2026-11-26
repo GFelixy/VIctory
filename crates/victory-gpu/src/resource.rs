@@ -974,8 +974,12 @@ impl Memory {
         let layout = Layout::from_size_align(info.size as usize, info.alignment as usize)
             .map_err(|_| E_INVALIDARG)?;
         let attributes = resource_attributes(info, heap_kind);
-        let ptr =
-            NonNull::new(alloc(layout.size(), attributes).cast::<u8>()).ok_or(E_OUTOFMEMORY)?;
+        // The runtime's allocator is the title's own memory: when it cannot give
+        // what was asked (it has its own budget), the resource is made out of
+        // host memory instead of failing a creation the title needs.
+        let Some(ptr) = NonNull::new(alloc(layout.size(), attributes).cast::<u8>()) else {
+            return Memory::new(info);
+        };
         // SAFETY: the allocator handed out `size` bytes.
         unsafe { ptr.as_ptr().write_bytes(0, layout.size()) };
         Ok(Memory {
@@ -1002,7 +1006,14 @@ impl Memory {
             .and_then(|(size, align)| Layout::from_size_align(size, align).ok())
             .ok_or(E_INVALIDARG)?;
         // SAFETY: the size is non-zero.
-        let ptr = NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or(E_OUTOFMEMORY)?;
+        let Some(ptr) = NonNull::new(unsafe { alloc_zeroed(layout) }) else {
+            tracing::warn!(
+                mb = info.size >> 20,
+                alignment = info.alignment,
+                "our own allocator could not give the title its memory"
+            );
+            return Err(E_OUTOFMEMORY);
+        };
         // The big ones are named in the log: the memory line counts our own
         // allocations by size, and these are the title's memory given out
         // of ours (a heap it made through the device, a descriptor heap).
@@ -1032,6 +1043,9 @@ struct Heap {
     object: Object,
     desc: HeapDesc,
     memory: Memory,
+    /// The host heap a forwarded heap is: created here, handed over as is.
+    #[cfg(windows)]
+    host: Option<windows::Win32::Graphics::Direct3D12::ID3D12Heap>,
 }
 
 pub(crate) extern "system" fn create_heap(
@@ -1061,11 +1075,43 @@ pub(crate) extern "system" fn create_heap(
         Ok(memory) => memory,
         Err(hr) => return hr,
     };
+    #[cfg(windows)]
+    let mut host_heap: Option<windows::Win32::Graphics::Direct3D12::ID3D12Heap> = None;
+    #[cfg(windows)]
+    if forward_only() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let Some(host) = crate::host::host() else {
+            return E_INVALIDARG;
+        };
+        let properties = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE(desc.properties.kind as i32),
+            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY(desc.properties.cpu_pages as i32),
+            MemoryPoolPreference: D3D12_MEMORY_POOL(desc.properties.pool as i32),
+            CreationNodeMask: desc.properties.creation_nodes,
+            VisibleNodeMask: desc.properties.visible_nodes,
+        };
+        let d3d = D3D12_HEAP_DESC {
+            SizeInBytes: desc.size,
+            Properties: properties,
+            Alignment: desc.alignment,
+            Flags: D3D12_HEAP_FLAGS(desc.flags as i32),
+        };
+        // SAFETY: a plain heap creation on a live device; the out pointer is ours.
+        if let Err(e) = unsafe { host.device.CreateHeap(&d3d, &mut host_heap) } {
+            tracing::warn!(error = %e, size = desc.size, "forwarded heap refused");
+            return E_INVALIDARG;
+        }
+    }
     let heap = Box::new(Heap {
         object: Object::new(&HEAP_FUNCTIONS),
         desc,
         memory,
+        #[cfg(windows)]
+        host: host_heap,
     });
+    if forward_only() || std::env::var_os("VICTORY_ANY_IID").is_some() {
+        return object::hand_out_any(HEAP, heap, out);
+    }
     object::hand_out(HEAP, heap, iid, &HEAP_IIDS, out)
 }
 
@@ -1084,8 +1130,20 @@ extern "system" fn heap_desc(this: This, out: *mut HeapDesc) {
 
 /// A resource's memory: its own, or a range of a heap it holds a reference
 /// to.
+/// `VICTORY_FORWARD_ONLY=1`: the resources the title creates ARE the host's
+/// D3D12 objects. Nothing here copies, watches or stages them: an injected
+/// layer (the standard-D3D12 upload patch) owns creation, upload and barriers,
+/// and this runtime only forwards. Off by default.
+fn forward_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FORWARD_ONLY").is_some_and(|v| v == "1"))
+}
+
 enum Backing {
     Committed(Memory),
+    /// A real host resource, created for the title and handed to it as is.
+    #[cfg(windows)]
+    Host(std::sync::Mutex<Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource>>),
     Placed {
         heap: This,
         offset: u64,
@@ -2075,6 +2133,12 @@ impl Resource {
                     .add(offset as usize)
             },
             Backing::Address(at) => at,
+            #[cfg(windows)]
+            Backing::Host(ref made) => made
+                .lock()
+                .ok()
+                .and_then(|m| m.as_ref().map(|r| unsafe { r.GetGPUVirtualAddress() } as *mut u8))
+                .unwrap_or(std::ptr::null_mut()),
         }
     }
 }
@@ -2135,12 +2199,47 @@ fn hand_out_resource(
     #[cfg(windows)]
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
+        if !forward_only() {
         crate::shadow::register(at, resource.data() as u64, desc.width);
+    }
+    }
+    if std::env::var_os("VICTORY_TRACE_RESOURCES").is_some() {
+        let at = std::ptr::from_ref(resource.as_ref()).cast::<std::ffi::c_void>();
+        let table = object::table_of(at.cast::<object::Object>());
+        tracing::info!(ptr = format_args!("{at:p}"), ?table, dim = desc.dimension, width = desc.width,
+                       "resource created");
     }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }
 
 #[cfg(windows)]
+/// The GPU address of a resource being built in the forward path, before it is
+/// handed out.
+#[cfg(windows)]
+fn copy2_address(resource: &Box<Resource>) -> u64 {
+    match resource.backing {
+        Backing::Host(ref made) => made
+            .lock()
+            .ok()
+            .and_then(|m| m.as_ref().map(|r| unsafe { r.GetGPUVirtualAddress() }))
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
+impl Resource {
+    /// The host resource behind a forwarded one, if this is forwarded.
+    #[cfg(windows)]
+    fn backing_host(
+        &self,
+    ) -> Result<Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource>, ()> {
+        match self.backing {
+            Backing::Host(ref made) => Ok(made.lock().map_err(|_| ())?.clone()),
+            _ => Ok(None),
+        }
+    }
+}
+
 impl Drop for Resource {
     fn drop(&mut self) {
         // Out of the table of textures first: the sweep looks at the ones
@@ -2221,9 +2320,101 @@ pub(crate) extern "system" fn create_committed(
         heap = heap.kind,
         "committed resource"
     );
+    // Forwarded: the title's committed resource is the host's own, created here
+    // and handed over as it is. An injected layer (the standard-D3D12 upload
+    // patch) owns uploads, copies and barriers for it.
+    #[cfg(windows)]
+    if forward_only() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        // E_FAIL, spelled here so the failure path does not depend on imports.
+        const E_FAIL: HRESULT = 0x8000_4005u32 as HRESULT;
+        let Some(host) = crate::host::host() else {
+            return E_FAIL;
+        };
+        let mut d = desc;
+        d.layout = 0;
+        d.alignment = 0;
+        let kind = match heap.kind {
+            2 => D3D12_HEAP_TYPE_UPLOAD,
+            3 => D3D12_HEAP_TYPE_READBACK,
+            _ => D3D12_HEAP_TYPE_DEFAULT,
+        };
+        let properties = D3D12_HEAP_PROPERTIES {
+            Type: kind,
+            ..Default::default()
+        };
+        let mut made: Option<ID3D12Resource> = None;
+        // SAFETY: the description is the title's own and stays valid for the
+        // call; the out pointer is ours.
+        let result = unsafe {
+            host.device.CreateCommittedResource(
+                &properties,
+                D3D12_HEAP_FLAG_NONE,
+                (&raw const d).cast(),
+                D3D12_RESOURCE_STATES(state as i32),
+                if clear.is_null() {
+                    None
+                } else {
+                    Some(clear.cast())
+                },
+                &mut made,
+            )
+        };
+        if let Err(e) = result {
+            tracing::warn!(error = %e, desc = ?d, "forwarded resource refused");
+            return E_FAIL;
+        }
+        let Some(made) = made else {
+            return E_FAIL;
+        };
+        // The host resource is its own copy: the draw path binds it directly
+        // instead of making one, which is what "forward only" means.
+        let bytes = footprint(&d).map_or(0, |f| f.size);
+        let copy = std::sync::Arc::new(HostTexture {
+            texture: made,
+            state: std::sync::atomic::AtomicU32::new(state),
+            bytes,
+            filled: false,
+        });
+        let resource = Box::new(Resource {
+            object: Object::new(&RESOURCE_FUNCTIONS),
+            desc: d,
+            heap,
+            heap_flags,
+            backing: Backing::Host(std::sync::Mutex::new(Some(copy.texture.clone()))),
+            host: Hosted {
+                made: std::sync::Mutex::new(Some((copy, None))),
+                state,
+                clear: None,
+                used: std::sync::atomic::AtomicU64::new(0),
+                refused: std::sync::atomic::AtomicBool::new(false),
+                gone: std::sync::atomic::AtomicBool::new(false),
+                placed: std::sync::atomic::AtomicBool::new(false),
+            },
+        });
+        let at = std::ptr::from_ref(resource.as_ref()) as usize;
+        let address = copy2_address(&resource);
+        // The tables the draw path looks things up in: without them a texture
+        // or a target the title names is not found.
+        if d.dimension != BUFFER {
+            textures().insert(at);
+            if !fills(&d) {
+                TARGETS_AT
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(address, at);
+            }
+        } else {
+            crate::shadow::register(at, address, d.width);
+        }
+        return object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out);
+    }
     let memory = match Memory::for_resource(info, heap.kind) {
         Ok(memory) => memory,
-        Err(hr) => return hr,
+        Err(hr) => {
+            tracing::warn!(size = info.size, hr, heap = heap.kind, "no memory for a resource");
+            return hr;
+        }
     };
     hand_out_resource(
         desc,
@@ -2504,6 +2695,61 @@ pub(crate) extern "system" fn create_placed(
         );
         return E_INVALIDARG;
     }
+    // Forwarded: the placed resource is the host's, made in the host heap.
+    #[cfg(windows)]
+    if forward_only() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        const E_FAIL: HRESULT = 0x8000_4005u32 as HRESULT;
+        let Some(host) = crate::host::host() else {
+            return E_FAIL;
+        };
+        let Some(host_heap) = h.host.clone() else {
+            return E_FAIL;
+        };
+        let mut d = desc;
+        d.layout = 0;
+        d.alignment = 0;
+        let mut made: Option<ID3D12Resource> = None;
+        // SAFETY: the description is the title's own; the heap is ours.
+        let result = unsafe {
+            host.device.CreatePlacedResource(
+                &host_heap,
+                offset,
+                (&raw const d).cast(),
+                D3D12_RESOURCE_STATES(state as i32),
+                if clear.is_null() {
+                    None
+                } else {
+                    Some(clear.cast())
+                },
+                &mut made,
+            )
+        };
+        if let Err(e) = result {
+            tracing::warn!(error = %e, desc = ?d, offset, "forwarded placed resource refused");
+            return E_FAIL;
+        }
+        let Some(made) = made else {
+            return E_FAIL;
+        };
+        let resource = Box::new(Resource {
+            object: Object::new(&RESOURCE_FUNCTIONS),
+            desc: d,
+            heap: h.desc.properties,
+            heap_flags: h.desc.flags,
+            backing: Backing::Host(std::sync::Mutex::new(Some(made))),
+            host: Hosted {
+                made: std::sync::Mutex::new(None),
+                state,
+                clear: None,
+                used: std::sync::atomic::AtomicU64::new(0),
+                refused: std::sync::atomic::AtomicBool::new(false),
+                gone: std::sync::atomic::AtomicBool::new(false),
+                placed: std::sync::atomic::AtomicBool::new(false),
+            },
+        });
+        return object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out);
+    }
     object::add_ref(heap);
     let backing = Backing::Placed { heap, offset };
     hand_out_resource(
@@ -2527,11 +2773,27 @@ extern "system" fn resource_query(this: This, iid: *const Iid, out: *mut This) -
     )
 }
 extern "system" fn resource_release(this: This) -> u32 {
-    object::release_boxed::<Resource>(this)
+    // `VICTORY_LEAK_RESOURCES=1`: a resource object is never freed, so its
+    // address is never handed to a later resource. A layer that knows the
+    // title's resources by pointer (an injected upload patch) then never
+    // confuses a new resource with a dead one at the same address.
+    if std::env::var_os("VICTORY_LEAK_RESOURCES").is_some() && object::refs_of(this) == 1 {
+        return object::add_ref(this);
+    }
+    let left = object::release_boxed::<Resource>(this);
+    // `VICTORY_TRACE_RESOURCES=1`: which resource was released, and what is
+    // left of its references (0 means this call freed it).
+    if std::env::var_os("VICTORY_TRACE_RESOURCES").is_some() {
+        tracing::info!(ptr = format_args!("{this:p}"), left, "resource release");
+    }
+    left
 }
 /// Memory is always mapped (subresources are not told apart yet); a null
 /// `out` only asks for residency.
 extern "system" fn map(this: This, _sub: u32, _read: *const c_void, out: *mut *mut u8) -> HRESULT {
+    if std::env::var_os("VICTORY_TRACE_RESOURCES").is_some() {
+        tracing::info!(ptr = format_args!("{this:p}"), table = ?object::table_of(this), "map");
+    }
     if !out.is_null() {
         // SAFETY: checked non-null; the title passes room for a pointer.
         unsafe { out.write(resource(this).data()) };
@@ -2539,11 +2801,20 @@ extern "system" fn map(this: This, _sub: u32, _read: *const c_void, out: *mut *m
     S_OK
 }
 extern "system" fn unmap(_: This, _sub: u32, _written: *const c_void) {}
-extern "system" fn resource_desc(this: This, out: *mut ResourceDesc) {
+// The console's `GetDesc` is an out-parameter method: `this` first, the
+// description it fills second (the ABI the title and an injected layer call
+// with). Reversing it writes 0x38 bytes over the object.
+extern "system" fn resource_desc(this: This, out: *mut ResourceDesc) -> *mut ResourceDesc {
+    if std::env::var_os("VICTORY_TRACE_RESOURCES").is_some() {
+        tracing::info!(ptr = format_args!("{this:p}"), table = ?object::table_of(this), "get_desc");
+    }
     if !out.is_null() {
         // SAFETY: checked non-null; the title passes room for a description.
         unsafe { out.write(resource(this).desc) };
     }
+    // The callers of this console layout treat a null return as failure: answer
+    // with the description they passed in.
+    out
 }
 /// Device method `GetCustomHeapProperties`, returning its struct through a
 /// hidden first argument: what a standard heap type is as a custom heap.

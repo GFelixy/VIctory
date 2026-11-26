@@ -17,7 +17,7 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_COMMITMENT_LIMIT, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER,
+    CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER, MEM_FREE,
     MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
     MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
     MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, SEC_COMMIT,
@@ -26,6 +26,13 @@ use windows_sys::Win32::System::Memory::{
 use windows_sys::Win32::System::ProcessStatus::{
     K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION,
     PROCESS_MEMORY_COUNTERS,
+};
+use windows_sys::Win32::System::Diagnostics::Debug::{
+    AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
+    EXCEPTION_POINTERS,
+};
+use windows_sys::Win32::System::Memory::{
+    MEMORY_BASIC_INFORMATION as MBI, VirtualAlloc as CommitPages, VirtualQuery,
 };
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::core::BOOL;
@@ -84,6 +91,133 @@ fn address_range(flags: u64) -> (usize, usize) {
     (1 << 32, (1 << bits) - 1)
 }
 
+/// A committed section view at `page`, for a write that arrives before the
+/// title maps the page itself. Kept alive for the process: the view is the
+/// memory.
+fn replace_placeholder(page: usize) -> bool {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Memory::MapViewOfFile3;
+    static SECTIONS: std::sync::Mutex<Vec<isize>> = std::sync::Mutex::new(Vec::new());
+    // SAFETY: plain calls with a page-sized section.
+    let section = unsafe {
+        CreateFileMappingW(
+            INVALID_HANDLE_VALUE,
+            std::ptr::null(),
+            SEC_RESERVE,
+            0,
+            0x1000,
+            std::ptr::null(),
+        )
+    };
+    if section.is_null() {
+        return false;
+    }
+    let view = unsafe {
+        MapViewOfFile3(
+            section,
+            GetCurrentProcess(),
+            page as *const core::ffi::c_void,
+            0,
+            0x1000,
+            0,
+            PAGE_READWRITE,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if view.Value.is_null() {
+        return false;
+    }
+    SECTIONS.lock().unwrap_or_else(|e| e.into_inner()).push(section as isize);
+    true
+}
+
+/// `VICTORY_COMMIT_ON_WRITE=1`: a write into a range the title only reserved
+/// commits that page and retries. A reservation of 64 KiB pages is mapped by
+/// the title itself (`XMemMapPhysicalPages`); when something else writes there
+/// first (a buffer the title asked to be placed at a fixed address, the video
+/// decoder filling it), the write used to end the process.
+fn commit_on_write() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_COMMIT_ON_WRITE").is_some_and(|v| v == "1");
+        if on {
+            // SAFETY: a handler that only calls VirtualQuery/VirtualAlloc.
+            let at = unsafe { AddVectoredExceptionHandler(1, Some(commit_write_handler)) };
+            tracing::info!(handler = ?at, "commit-on-write handler installed");
+        }
+        on
+    })
+}
+
+/// The handler itself: a write fault inside reserved memory commits the page
+/// and lets the instruction run again.
+unsafe extern "system" fn commit_write_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
+    // SAFETY: the system passes a valid record.
+    let record = unsafe { (*info).ExceptionRecord };
+    if record.is_null() {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    if unsafe { (*record).ExceptionCode } != 0xc000_0005u32 as i32 {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    let information = unsafe { &(*record).ExceptionInformation };
+    // 1 is a write; a read of a reservation stays a real fault.
+    if information[0] != 1 {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    let at = information[1] as usize;
+    let mut found: MBI = unsafe { std::mem::zeroed() };
+    let asked = unsafe {
+        VirtualQuery(
+            at as *const core::ffi::c_void,
+            &raw mut found,
+            std::mem::size_of::<MBI>(),
+        )
+    };
+
+    let page = (at & !(0x1000 - 1)) as *const core::ffi::c_void;
+    match asked {
+        0 => {}
+        _ if found.State == MEM_RESERVE => {
+            // SAFETY: the page belongs to this process and is only reserved.
+            let committed =
+                unsafe { CommitPages(page as *mut core::ffi::c_void, 0x1000, MEM_COMMIT, PAGE_READWRITE) };
+            if !committed.is_null() {
+                tracing::debug!(at = format_args!("{at:#x}"), "committed a reserved page on write");
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+        }
+        _ if found.State == MEM_FREE => {
+            // A buffer the title placed at a fixed address, whose memory the
+            // caller never got mapped here: give the write a page of its own.
+            let made = unsafe {
+                CommitPages(
+                    page as *mut core::ffi::c_void,
+                    0x1000,
+                    MEM_COMMIT | MEM_RESERVE,
+                    PAGE_READWRITE,
+                )
+            };
+            if !made.is_null() {
+                tracing::warn!(at = format_args!("{at:#x}"), "gave an unmapped write a page");
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+            if replace_placeholder(page as usize) {
+                tracing::warn!(at = format_args!("{at:#x}"), "replaced a placeholder for a write");
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+            tracing::warn!(
+                at = format_args!("{at:#x}"),
+                error = %std::io::Error::last_os_error(),
+                "could not give the unmapped write a page"
+            );
+        }
+        _ => {}
+    }
+    EXCEPTION_CONTINUE_SEARCH
+}
+
 pub extern "system" fn XMemVirtualAlloc(
     base: *mut c_void,
     size: usize,
@@ -91,6 +225,7 @@ pub extern "system" fn XMemVirtualAlloc(
     flags: u64,
     protect: u32,
 ) -> *mut c_void {
+    commit_on_write();
     let (lowest, highest) = address_range(flags);
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: lowest as *mut c_void,
@@ -239,6 +374,7 @@ type FreeRoutine = extern "system" fn(*mut c_void, u64);
 /// `XMemFree` call them, for the title's own calls and its middleware's;
 /// the `…Default` exports do not.
 fn hooks() -> [usize; 2] {
+    commit_on_write();
     static AT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     let at = match AT.get() {
         Some(&at) => at,
@@ -329,6 +465,14 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     if address.is_null() {
         return;
     }
+    // `VICTORY_KEEP_FREED=1`: the memory stays, so a thread still writing to
+    // what the title freed (a video decoder's frame buffer during a stop) does
+    // not fault. A diagnostic switch only: memory is never given back.
+    static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *KEEP.get_or_init(|| std::env::var_os("VICTORY_KEEP_FREED").is_some_and(|v| v == "1")) {
+        tracing::debug!(address = ?address, "kept memory the title freed");
+        return;
+    }
     // SAFETY: the address came from `XMemAlloc` with these attributes: a
     // whole reservation, or a header-prefixed block.
     unsafe {
@@ -405,6 +549,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     count: *mut usize,
     pages: *mut usize,
 ) -> BOOL {
+    commit_on_write();
     if count.is_null() || pages.is_null() {
         return 0;
     }
@@ -828,6 +973,11 @@ fn commit_limit_message(
 /// Returns `[base, base + len)` to placeholders; views reaching past it
 /// are mapped again outside it.
 fn unmap(physical: &mut Physical, base: usize, len: usize) {
+    tracing::debug!(
+        base = format_args!("{base:#x}"),
+        len = format_args!("{len:#x}"),
+        "unmap"
+    );
     // No bytes: no view to return. The search below would still find the
     // view holding `base` and cut it in two there, and its range of views
     // starting inside would run backwards (which `BTreeMap` panics on).
